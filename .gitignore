@@ -1,0 +1,8 @@
+.vagrant
+google
+.vscode
+*.json
+*.wav
+
+#because it's easy to keep this here
+dfe_testsuite
