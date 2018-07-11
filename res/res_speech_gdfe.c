@@ -18,7 +18,7 @@
  */
 
 /*** MODULEINFO
-	<depend>dialogflow</depend>
+	<depend>dfegrpc</depend>
  ***/
 
 #include <asterisk.h>
@@ -35,7 +35,7 @@
 #include <asterisk/config.h>
 #include <asterisk/ulaw.h>
 
-#include <libdialogflow.h>
+#include <libdfegrpc.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>

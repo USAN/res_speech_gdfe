@@ -4,7 +4,7 @@
  AST_EXT_LIB_SETUP([X11], [X11], [x11])
  AST_EXT_LIB_SETUP([ZLIB], [zlib compression], [z])
  
-+AST_EXT_LIB_SETUP([DIALOGFLOW], [Google Dialogflow], [dialogflow])
++AST_EXT_LIB_SETUP([DFEGRPC], [Dialogflow gRPC], [dfegrpc])
 +
  # check for basic system features and functionality before
  # checking for package libraries
@@ -13,7 +13,7 @@
  AST_EXT_LIB_CHECK([VORBIS], [vorbis], [vorbis_info_init], [vorbis/codec.h], [-lm -lvorbisenc -lvorbisfile])
  AST_C_DECLARE_CHECK([VORBIS_OPEN_CALLBACKS], [OV_CALLBACKS_NOCLOSE], [vorbis/vorbisfile.h])
  
-+AST_EXT_LIB_CHECK([DIALOGFLOW], [dialogflow], [df_init], [libdialogflow.h], [-lprotobuf -lgrpc++ -lstdc++])
++AST_EXT_LIB_CHECK([DFEGRPC], [dfegrpc], [df_init], [libdfegrpc.h], [-lprotobuf -lgrpc++ -lstdc++])
 +
  AC_LANG_PUSH(C++)
  

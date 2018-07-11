@@ -14,12 +14,12 @@ ASTERISK_VERSION="13.21.1"
 ASTERISK_ARCHIVE=asterisk-${ASTERISK_VERSION}.tar.gz
 ASTERISK_DIR=asterisk-${ASTERISK_VERSION}
 
-LIBDIALOGFLOW_BRANCH="master"
+LIBDFEGRPC_BRANCH="master"
 
 WORKDIR=/tmp
 
-if [ ! -e ${WORKDIR}/libdialogflow ] ; then
-    printf "\e[93mCloning libdialogflow...\e[39m\n"
+if [ ! -e ${WORKDIR}/libdfegrpc ] ; then
+    printf "\e[93mCloning libdfegrpc...\e[39m\n"
 
     if grep centos /etc/os-release ; then 
         sudo yum install -y git
@@ -34,9 +34,9 @@ if [ ! -e ${WORKDIR}/libdialogflow ] ; then
 
     git clone https://github.com/USAN/libdfegrpc.git
 
-    pushd libdialogflow
+    pushd libdfegrpc
 
-    git checkout ${LIBDIALOGFLOW_BRANCH}
+    git checkout ${LIBDFEGRPC_BRANCH}
     bash ./install_protoc.sh
 
     make
@@ -47,7 +47,7 @@ if [ ! -e ${WORKDIR}/libdialogflow ] ; then
 
     popd
 else
-    printf "\e[93mlibdialogflow already installed.\e[39m\n"
+    printf "\e[93mlibdfegrpc already installed.\e[39m\n"
 fi
 
 if [ ! -e ${WORKDIR}/${ASTERISK_ARCHIVE} ] ; then
@@ -77,23 +77,23 @@ BOOTSTRAP=0
 # cp -v res_speech_gdfe.c ${WORKDIR}/${ASTERISK_DIR}/res/res_speech_gdfe.c
 rsync -avz res/ ${WORKDIR}/${ASTERISK_DIR}/res/
 
-if grep PBX_DIALOGFLOW ${WORKDIR}/${ASTERISK_DIR}/build_tools/menuselect-deps.in > /dev/null ; then
+if grep PBX_DFEGRPC ${WORKDIR}/${ASTERISK_DIR}/build_tools/menuselect-deps.in > /dev/null ; then
     printf "\e[93mMenuselect-deps.in already modified\e[39m\n"
 else
     printf "\e[93mModifying Menuselect-deps.in\e[39m\n"
-    printf "\nDIALOGFLOW=@PBX_DIALOGFLOW@\n" >> ${WORKDIR}/${ASTERISK_DIR}/build_tools/menuselect-deps.in
+    printf "\nDFEGRPC=@PBX_DFEGRPC@\n" >> ${WORKDIR}/${ASTERISK_DIR}/build_tools/menuselect-deps.in
     BOOTSTRAP=1
 fi
 
-if grep DIALOGFLOW_INCLUDE ${WORKDIR}/${ASTERISK_DIR}/makeopts.in > /dev/null ; then
+if grep DFEGRPC_INCLUDE ${WORKDIR}/${ASTERISK_DIR}/makeopts.in > /dev/null ; then
     printf "\e[93mmakeopts.in already modified\e[39m\n"
 else
     printf "\e[93mModifying makeopts.in\e[39m\n"
-    printf "\nDIALOGFLOW_INCLUDE=@DIALOGFLOW_INCLUDE@\nDIALOGFLOW_LIB=@DIALOGFLOW_LIB@\n" >> ${WORKDIR}/${ASTERISK_DIR}/makeopts.in
+    printf "\nDFEGRPC_INCLUDE=@DFEGRPC_INCLUDE@\nDFEGRPC_LIB=@DFEGRPC_LIB@\n" >> ${WORKDIR}/${ASTERISK_DIR}/makeopts.in
     BOOTSTRAP=1
 fi
 
-if grep DIALOGFLOW ${WORKDIR}/${ASTERISK_DIR}/configure.ac > /dev/null ; then
+if grep DFEGRPC ${WORKDIR}/${ASTERISK_DIR}/configure.ac > /dev/null ; then
     printf "\e[93mconfigure.ac already modified\e[39m\n"
 else
     printf "\e[93mPatching configure.ac\e[39m\n"
