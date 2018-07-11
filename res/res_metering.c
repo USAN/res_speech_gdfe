@@ -61,7 +61,7 @@ static struct timeval interval_end;
 
 static int max_consecutive_failures = 2;
 static int interval = 5;
-static const char *report_url = "http://ubbagent:3456/report";
+static const char *report_url = "http://localhost:4242/report";
 
 static struct timeval next_interval_end(int interval_minutes, struct timeval basis)
 {
