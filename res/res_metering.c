@@ -109,7 +109,7 @@ static void stop_asterisk(void)
 
 static size_t curl_report_data_callback(char *ptr, size_t size, size_t nmemb, void *data)
 {
-    ast_log(LOG_DEBUG, "Got data on report callback. That's unexpected.\n");
+    ast_log(LOG_DEBUG, "Got unexpected data on usage report -- '%.*s'.\n", (size * nmemb), ptr);
     return size * nmemb;
 }
 
@@ -160,10 +160,21 @@ static int send_metric_data(const void *_)
         RAII_VAR(struct curl_slist *, headers, NULL, curl_slist_free_all);
         RAII_VAR(struct ast_str *, header, ast_str_create(128), ast_free);
         CURLcode res;
+        char start[AST_ISO8601_LEN];
+        char end[AST_ISO8601_LEN];
+        struct ast_tm tmstart = {};
+        struct ast_tm tmend = {};
+        long http_code = 0;
+        
+        ast_localtime(&tvstart, &tmstart, NULL);
+        ast_localtime(&tvend, &tmend, NULL);
+
+        ast_strftime(start, sizeof(start), "%FT%TZ", &tmstart);
+        ast_strftime(end, sizeof(end), "%FT%TZ", &tmend);
 
         ast_json_object_set(data, "name", ast_json_string_create("concurrentCalls"));
-        ast_json_object_set(data, "startTime", ast_json_timeval(tvstart, NULL));
-        ast_json_object_set(data, "endTime", ast_json_timeval(tvend, NULL));
+        ast_json_object_set(data, "startTime", ast_json_string_create(start));
+        ast_json_object_set(data, "endTime", ast_json_string_create(end));
         obj = ast_json_object_create();
         ast_json_object_set(data, "value", obj);
         ast_json_object_set(obj, "int64Value", ast_json_integer_create(count));
@@ -185,12 +196,15 @@ static int send_metric_data(const void *_)
 
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
-        ast_log(LOG_DEBUG, "Posting usage metric '%s' to %s\n", body, report_url);
+        if (option_debug) {
+            ast_log(LOG_DEBUG, "Posting usage metric '%s' to %s\n", body, report_url);
+        }
 
         res = curl_easy_perform(curl);
-        if (res != CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        if (res != CURLE_OK || http_code != 200) {
             consecutive_failures++;
-            ast_log(LOG_WARNING, "Got error posting metric to %s -- %s\n", report_url, curl_easy_strerror(res));
+            ast_log(LOG_WARNING, "Got error %d posting metric to %s -- %s\n", http_code, report_url, curl_easy_strerror(res));
 
             /* try to reset the metrics so if we do eventually get through it's correct */
             ast_mutex_lock(&count_lock);
@@ -212,7 +226,7 @@ static int send_metric_data(const void *_)
     metric_sched_id = ast_sched_add(metric_scheduler, resched_ms, send_metric_data, NULL);
     if (metric_sched_id < 0) {
         ast_log(LOG_WARNING, "Failed to add schedule for metering\n");
-    } else {
+    } else if (option_debug) {
         ast_log(LOG_DEBUG, "Scheduled next metering event %dms from now\n", resched_ms);
     }
     return 0;
