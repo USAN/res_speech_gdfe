@@ -279,7 +279,9 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	}
 
 	if (vad_state != VAD_STATE_START) {
-		ast_log(LOG_DEBUG, "Writing audio to dfe\n");
+		if (option_debug >= 5) {
+			ast_log(LOG_DEBUG, "Writing audio to dfe\n");
+		}
 		state = df_write_audio(pvt->session, data, len);
 
 		if (!ast_test_flag(speech, AST_SPEECH_QUIET) && df_get_response_count(pvt->session) > 0) {
