@@ -18,6 +18,7 @@
  */
 
 /*** MODULEINFO
+    <depend>res_speech</depend>
 	<depend>dfegrpc</depend>
  ***/
 
@@ -28,10 +29,21 @@
 #include <asterisk/cli.h>
 #include <asterisk/term.h>
 #include <asterisk/speech.h>
+
+#ifdef RAII_VAR
+#define ASTERISK_13_OR_LATER
+#endif
+
+#ifdef ASTERISK_13_OR_LATER
+#include <asterisk/format.h>
 #include <asterisk/format_cache.h>
 #include <asterisk/codec.h>
-#include <asterisk/format.h>
 #include <asterisk/format_cap.h>
+#else
+#include <asterisk/frame.h>
+#include <asterisk/astobj2.h>
+#endif
+
 #include <asterisk/config.h>
 #include <asterisk/ulaw.h>
 
@@ -89,7 +101,13 @@ struct gdf_config {
 
 static struct gdf_config *gdf_get_config(void);
 
-static int gdf_create(struct ast_speech *speech, struct ast_format *format)
+#ifdef ASTERISK_13_OR_LATER
+typedef struct ast_format *local_ast_format_t;
+#else
+typedef int local_ast_format_t;
+#endif
+
+static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 {
 	struct gdf_pvt *pvt;
 	struct gdf_config *cfg;
@@ -402,6 +420,7 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 	return 0;
 }
 
+#ifdef ASTERISK_13_OR_LATER
 static int gdf_get_setting(struct ast_speech *speech, const char *name, char *buf, size_t len)
 {
 	struct gdf_pvt *pvt = speech->data;
@@ -433,6 +452,7 @@ static int gdf_get_setting(struct ast_speech *speech, const char *name, char *bu
 
 	return 0;
 }
+#endif
 
 static int gdf_change_results_type(struct ast_speech *speech, enum ast_speech_results_type results_type)
 {
@@ -587,7 +607,11 @@ static void gdf_config_destroy(void *o)
 static struct gdf_config *gdf_get_config(void)
 {
 	struct gdf_config *cfg;
+#ifdef ASTERISK_13_OR_LATER
 	ao2_rdlock(config);
+#else
+	ao2_lock(config);
+#endif
 	cfg = ao2_find(config, NULL, 0);
 	ao2_unlock(config);
 	return cfg;
@@ -595,7 +619,7 @@ static struct gdf_config *gdf_get_config(void)
 
 static int load_config(int reload)
 {
-	RAII_VAR(struct ast_config *, cfg, NULL, ast_config_destroy);
+	struct ast_config *cfg = NULL;
 	struct ast_flags config_flags = { reload ? CONFIG_FLAG_FILEUNCHANGED : 0 };
 
 	cfg = ast_config_load("res_speech_gdfe.conf", config_flags);
@@ -699,7 +723,11 @@ static int load_config(int reload)
 		}
 
 		/* swap out the configs */
+#ifdef ASTERISK_13_OR_LATER
 		ao2_wrlock(config);
+#else
+		ao2_lock(config);
+#endif
 		{
 			struct gdf_config *old_config = gdf_get_config();
 			ao2_unlink(config, old_config);
@@ -708,6 +736,10 @@ static int load_config(int reload)
 		ao2_link(config, conf);
 		ao2_unlock(config);
 		ao2_ref(conf, -1);
+	}
+
+	if (cfg) {
+		ast_config_destroy(cfg);
 	}
 	
 	return AST_MODULE_LOAD_SUCCESS;
@@ -740,7 +772,9 @@ static struct ast_speech_engine gdf_engine = {
 	.dtmf = gdf_dtmf,
 	.start = gdf_start,
 	.change = gdf_change,
+#ifdef ASTERISK_13_OR_LATER
 	.get_setting = gdf_get_setting,
+#endif
 	.change_results_type = gdf_change_results_type,
 	.get = gdf_get_results
 };
@@ -769,6 +803,7 @@ static enum ast_module_load_result load_module(void)
 		ast_log(LOG_WARNING, "Failed to load configuration\n");
 	}
 
+#ifdef ASTERISK_13_OR_LATER
 	gdf_engine.formats = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT);
 
 	if (!gdf_engine.formats) {
@@ -778,6 +813,9 @@ static enum ast_module_load_result load_module(void)
 	}
 
 	ast_format_cap_append(gdf_engine.formats, ast_format_ulaw, 20);
+#else
+	gdf_engine.formats = AST_FORMAT_ULAW;
+#endif
 
 	if (ast_speech_register(&gdf_engine)) {
 		ast_log(LOG_WARNING, "DFE speech failed to register with speech subsystem\n");
@@ -801,7 +839,9 @@ static int unload_module(void)
 		return -1;
 	}
 
+#ifdef ASTERISK_13_OR_LATER
 	ao2_t_ref(gdf_engine.formats, -1, "unloading module");
+#endif
 
 	return 0;
 }
