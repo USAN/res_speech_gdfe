@@ -1,0 +1,9 @@
+--- build_tools/menuselect-deps.in
++++ build_tools/menuselect-deps.in
+@@ -71,3 +71,6 @@ JANSSON=@PBX_JANSSON@
+ YAJL=@PBX_YAJL@
+ EXPAT=@PBX_EXPAT@
+ 
++# BEGIN RES_SPEECH_DFE
++DFEGRPC=@PBX_DFEGRPC@
++# END RES_SPEECH_DFE
