@@ -93,12 +93,12 @@ struct gdf_config {
 	int vad_voice_minimum_duration;
 	int vad_silence_minimum_duration;
 
-	int enableCallLogs;
+	int enable_call_logs;
 
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(service_key);
 		AST_STRING_FIELD(endpoint);
-		AST_STRING_FIELD(callLogLocation);
+		AST_STRING_FIELD(call_log_location);
 	);
 };
 
@@ -726,10 +726,10 @@ static int load_config(int reload)
 			}
 		}
 
-		ast_string_field_set(conf, callLogLocation, "/var/log/dialogflow/${CONTEXT}/${STRFTIME(,,%%Y/%%m/%%d/%%H)}/");
-		val = ast_variable_retrieve(cfg, "general", "callLogLocation");
+		ast_string_field_set(conf, call_log_location, "/var/log/dialogflow/${CONTEXT}/${STRFTIME(,,%%Y/%%m/%%d/%%H)}/");
+		val = ast_variable_retrieve(cfg, "general", "call_log_location");
 		if (!ast_strlen_zero(val)) {
-			ast_string_field_set(conf, callLogLocation, val);
+			ast_string_field_set(conf, call_log_location, val);
 		}
 
 		/* swap out the configs */
@@ -797,8 +797,8 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "vad_voice_threshold = %d\n", config->vad_voice_threshold);
 			ast_cli(a->fd, "vad_voice_minimum_duration = %d\n", config->vad_voice_minimum_duration);
 			ast_cli(a->fd, "vad_silence_minimum_duration = %d\n", config->vad_silence_minimum_duration);
-			ast_cli(a->fd, "enableCallLogs = %s\n", AST_CLI_YESNO(config->enableCallLogs));
-			ast_cli(a->fd, "callLogLocation = %s\n", config->callLogLocation);
+			ast_cli(a->fd, "enable_call_logs = %s\n", AST_CLI_YESNO(config->enable_call_logs));
+			ast_cli(a->fd, "call_log_location = %s\n", config->call_log_location);
 			ao2_ref(config, -1);
 		} else {
 			ast_cli(a->fd, "Unable to retrieve configuration\n");
