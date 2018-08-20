@@ -617,12 +617,13 @@ static struct gdf_config *gdf_get_config(void)
 	return cfg;
 }
 
+#define CONFIGURATION_FILENAME		"res_speech_gdfe.conf"
 static int load_config(int reload)
 {
 	struct ast_config *cfg = NULL;
 	struct ast_flags config_flags = { reload ? CONFIG_FLAG_FILEUNCHANGED : 0 };
 
-	cfg = ast_config_load("res_speech_gdfe.conf", config_flags);
+	cfg = ast_config_load(CONFIGURATION_FILENAME, config_flags);
 	if (cfg == CONFIG_STATUS_FILEUNCHANGED) {
 		ast_log(LOG_DEBUG, "Configuration unchanged.\n");
 	} else {
@@ -745,6 +746,63 @@ static int load_config(int reload)
 	return AST_MODULE_LOAD_SUCCESS;
 }
 
+static char *gdfe_reload(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "gdfe reload";
+		e->usage = 
+			"Usage: gdfe reload\n"
+			"       Reload res_speech_gdfe configuration.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	default:
+		ast_cli(a->fd, "Reloading res_speech_gdfe config from " CONFIGURATION_FILENAME "\n");
+		load_config(1);
+		ast_cli(a->fd, "Reload complete\n");
+		ast_cli(a->fd, "\n\n");
+		return CLI_SUCCESS;
+	}
+}
+
+static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_args *a)
+{
+	struct gdf_config *config;
+	
+	switch (cmd) {
+	case CLI_INIT:
+		e->command = "gdfe show config";
+		e->usage = 
+			"Usage: gdfe show config\n"
+			"       Show current gdfe configuration.\n";
+		return NULL;
+	case CLI_GENERATE:
+		return NULL;
+	default:
+		config = gdf_get_config();
+		if (config) {
+			ast_cli(a->fd, "[general]\n");
+			ast_cli(a->fd, "service_key = %s\n", config->service_key);
+			ast_cli(a->fd, "endpoint = %s\n", config->endpoint);
+			ast_cli(a->fd, "vad_voice_threshold = %d\n", config->vad_voice_threshold);
+			ast_cli(a->fd, "vad_voice_minimum_duration = %d\n", config->vad_voice_minimum_duration);
+			ast_cli(a->fd, "vad_silence_minimum_duration = %d\n", config->vad_silence_minimum_duration);
+			ao2_ref(config, -1);
+		} else {
+			ast_cli(a->fd, "Unable to retrieve configuration\n");
+		}
+		ast_cli(a->fd, "\n");
+		return CLI_SUCCESS;
+	}
+}
+
+static struct ast_cli_entry gdfe_cli[] = {
+	AST_CLI_DEFINE(gdfe_reload, "Reload gdfe configuration"),
+	AST_CLI_DEFINE(gdfe_show_config, "Show current gdfe configuration"),
+};
+
+
 static void gdf_log(enum dialogflow_log_level level, const char *file, int line, const char *function, const char *fmt, va_list args)
 {
 	char *buff;
@@ -829,6 +887,8 @@ static enum ast_module_load_result load_module(void)
 		return AST_MODULE_LOAD_FAILURE;
 	}
 
+	ast_cli_register_multiple(gdfe_cli, ARRAY_LEN(gdfe_cli));
+
 	return AST_MODULE_LOAD_SUCCESS;
 }
 
@@ -838,6 +898,8 @@ static int unload_module(void)
 		ast_log(LOG_WARNING, "Failed to unregister GDF speech engine\n");
 		return -1;
 	}
+
+	ast_cli_unregister_multiple(gdfe_cli, ARRAY_LEN(gdfe_cli));
 
 #ifdef ASTERISK_13_OR_LATER
 	ao2_t_ref(gdf_engine.formats, -1, "unloading module");
