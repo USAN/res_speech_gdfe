@@ -1,20 +1,22 @@
---- configure.orig	2018-06-18 20:58:58.614591131 +0000
-+++ configure.ac	2018-06-18 20:59:03.000000000 +0000
-@@ -574,6 +574,8 @@
+--- configure.ac
++++ configure.ac
+@@ -464,6 +464,9 @@ AST_EXT_LIB_SETUP([VORBIS], [Vorbis], [vorbis])
+ AST_EXT_LIB_SETUP([VPB], [Voicetronix API], [vpb])
  AST_EXT_LIB_SETUP([X11], [X11], [x11])
  AST_EXT_LIB_SETUP([ZLIB], [zlib compression], [z])
- 
++# BEGIN RES_SPEECH_DFE
 +AST_EXT_LIB_SETUP([DFEGRPC], [Dialogflow gRPC], [dfegrpc])
-+
++# END RES_SPEECH_DFE
+ 
  # check for basic system features and functionality before
  # checking for package libraries
- 
-@@ -2525,6 +2527,8 @@
- AST_EXT_LIB_CHECK([VORBIS], [vorbis], [vorbis_info_init], [vorbis/codec.h], [-lm -lvorbisenc -lvorbisfile])
+@@ -2118,6 +2121,9 @@ else
+ fi
  AST_C_DECLARE_CHECK([VORBIS_OPEN_CALLBACKS], [OV_CALLBACKS_NOCLOSE], [vorbis/vorbisfile.h])
  
++# BEGIN RES_SPEECH_DFE
 +AST_EXT_LIB_CHECK([DFEGRPC], [dfegrpc], [df_init], [libdfegrpc.h], [-lprotobuf -lgrpc++ -lstdc++])
-+
++# END RES_SPEECH_DFE
  AC_LANG_PUSH(C++)
  
  if test "${USE_VPB}" != "no"; then

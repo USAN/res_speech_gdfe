@@ -1,0 +1,10 @@
+--- makeopts.in
++++ makeopts.in
+@@ -314,3 +314,7 @@ TINFO_DIR=@TINFO_DIR@
+ # if poll is not present, let the makefile know.
+ POLL_AVAILABLE=@HAS_POLL@
+ TIMERFD_INCLUDE=@TIMERFD_INCLUDE@
++# BEGIN RES_SPEECH_DFE
++DFEGRPC_INCLUDE=@DFEGRPC_INCLUDE@
++DFEGRPC_LIB=@DFEGRPC_LIB@
++# END RES_SPEECH_DFE
