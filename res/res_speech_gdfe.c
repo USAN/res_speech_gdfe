@@ -400,7 +400,7 @@ static void start_call_log(struct gdf_pvt *pvt)
 
 		ast_mkdir(ast_str_buffer(path), 0644);
 
-		ast_str_append(&path, 0, pvt->session_id);
+		ast_str_append(&path, 0, "%s.LOG", pvt->session_id);
 
 		log_file = fopen(ast_str_buffer(path), "w");
 		if (log_file) {
