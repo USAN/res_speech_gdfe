@@ -301,6 +301,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 			vad_state = VAD_STATE_SPEAK;
 			change_duration = 0;
 			cur_duration = 0;
+			gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "start_of_speech");
 		}
 	} else if (vad_state == VAD_STATE_SPEAK) {
 		if (change_duration >= silence_duration) {
@@ -309,6 +310,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 			vad_state = VAD_STATE_SILENT;
 			change_duration = 0;
 			cur_duration = 0;
+			gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "end_of_speech");
 		}
 	}
 
@@ -418,6 +420,32 @@ static void start_call_log(struct gdf_pvt *pvt)
 	ast_var_delete(var);
 }
 
+static void log_endpointer_start_event(struct gdf_pvt *pvt)
+{
+	int pvt_threshold;
+	char threshold[11];
+	int pvt_voice_duration;
+	char voice_duration[11];
+	int pvt_silence_duration;
+	char silence_duration[11];
+
+	ast_mutex_lock(&pvt->lock);
+	pvt_threshold = pvt->voice_threshold;
+	pvt_voice_duration = pvt->voice_minimum_duration;
+	pvt_silence_duration = pvt->silence_minimum_duration;
+	ast_mutex_unlock(&pvt->lock);
+
+	sprintf(threshold, "%d", pvt_threshold);
+	sprintf(voice_duration, "%d", pvt_voice_duration);
+	sprintf(silence_duration, "%d", pvt_silence_duration);
+
+	gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "start", 
+		VAD_PROP_VOICE_THRESHOLD, threshold,
+		VAD_PROP_VOICE_DURATION, voice_duration,
+		VAD_PROP_SILENCE_DURATION, silence_duration,
+		NULL);
+}
+
 static int gdf_start(struct ast_speech *speech)
 {
 	struct gdf_pvt *pvt = speech->data;
@@ -440,6 +468,7 @@ static int gdf_start(struct ast_speech *speech)
 	}
 
 	gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "start", "event", event, "language", language, "project_id", project_id, NULL);
+	log_endpointer_start_event(pvt);
 	
 	if (!ast_strlen_zero(event)) {
 		if (df_recognize_event(pvt->session, event, language)) {
