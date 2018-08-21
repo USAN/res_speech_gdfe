@@ -958,7 +958,7 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 	timeval_now = ast_tvnow();
 	ast_localtime(&timeval_now, &tm_now, NULL);
 
-	ast_strftime(char_now, sizeof(char_now), "%FT%TZ", &tm_now);
+	ast_strftime(char_now, sizeof(char_now), "%FT%T.%q%z", &tm_now);
 
 	if (type == CALL_LOG_TYPE_SESSION) {
 		char_type = "SESSION";
