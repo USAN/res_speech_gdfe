@@ -44,6 +44,8 @@
 #include <asterisk/astobj2.h>
 #endif
 
+#include <asterisk/chanvars.h>
+#include <asterisk/pbx.h>
 #include <asterisk/config.h>
 #include <asterisk/ulaw.h>
 
@@ -77,12 +79,18 @@ struct gdf_pvt {
 	int voice_threshold; /* 0 - (2^16 - 1) */
 	int voice_minimum_duration; /* ms */
 	int silence_minimum_duration; /* ms */
+
+	int call_log_open_already_attempted;
+	FILE *call_log_file_handle;
 	
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(session_id);
 		AST_STRING_FIELD(event);
 		AST_STRING_FIELD(language);
 		AST_STRING_FIELD(lastAudioResponse);
+
+		AST_STRING_FIELD(call_log_path);
+		AST_STRING_FIELD(call_logging_context);
 	);
 };
 
@@ -145,6 +153,7 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	pvt->voice_threshold = cfg->vad_voice_threshold;
 	pvt->voice_minimum_duration = cfg->vad_voice_minimum_duration;
 	pvt->silence_minimum_duration = cfg->vad_silence_minimum_duration;
+	ast_string_field_set(pvt, call_logging_context, "unknown");
 
 	ast_mutex_lock(&speech->lock);
 	speech->state = AST_SPEECH_STATE_NOT_READY;
@@ -169,6 +178,11 @@ static int gdf_destroy(struct ast_speech *speech)
 	}
 
 	df_close_session(pvt->session);
+
+	if (pvt->call_log_file_handle != NULL) {
+		fclose(pvt->call_log_file_handle);
+	}
+
 	ast_string_field_free_memory(pvt);
 	ast_mutex_destroy(&pvt->lock);
 	return 0;
@@ -324,6 +338,67 @@ static int gdf_dtmf(struct ast_speech *speech, const char *dtmf)
 	return -1;
 }
 
+static int should_start_call_log(struct gdf_pvt *pvt)
+{
+	int should_start;
+	ast_mutex_lock(&pvt->lock);
+	should_start = !pvt->call_log_open_already_attempted;
+	ast_mutex_unlock(&pvt->lock);
+	if (should_start) {
+		struct gdf_config *cfg;
+		cfg = gdf_get_config();
+		if (cfg) {
+			should_start &= cfg->enable_call_logs;
+			ao2_t_ref(cfg, -1, "done checking for starting call log");
+		}
+	}
+	return should_start;
+}
+
+
+AST_THREADSTORAGE(call_log_path);
+static void start_call_log(struct gdf_pvt *pvt)
+{
+	struct varshead var_head = { .first = NULL, .last = NULL };
+	struct ast_var_t *var;
+	struct gdf_config *cfg;
+
+	ast_mutex_lock(&pvt->lock);
+	var = ast_var_assign("CONTEXT", pvt->call_logging_context);
+	pvt->call_log_open_already_attempted = 1;
+	ast_mutex_unlock(&pvt->lock);
+
+	AST_LIST_INSERT_HEAD(&var_head, var, entries);
+
+	cfg = gdf_get_config();
+	if (cfg) {
+		FILE *log_file;
+		struct ast_str *path = ast_str_thread_get(&call_log_path, 256);
+
+		ast_str_substitute_variables_varshead(&path, 0, &var_head, cfg->call_log_location);
+
+		ast_mkdir(ast_str_buffer(path), 0644);
+
+		ast_str_append(&path, 0, pvt->session_id);
+
+		log_file = fopen(ast_str_buffer(path), "w");
+		if (log_file) {
+			ast_log(LOG_DEBUG, "Opened %s for call log for %s\n", ast_str_buffer(path), pvt->session_id);
+			ast_mutex_lock(&pvt->lock);
+			pvt->call_log_file_handle = log_file;
+			ast_mutex_unlock(&pvt->lock);
+		} else {
+			ast_log(LOG_WARNING, "Unable to open %s for writing call log for %s -- %d: %s\n", ast_str_buffer(path), pvt->session_id, errno, strerror(errno));
+		}
+
+		ao2_t_ref(cfg, -1, "done with config in starting call log");
+	} else {
+		ast_log(LOG_WARNING, "Not starting call log, unable to find configuration\n");
+	}
+
+	ast_var_delete(var);
+}
+
 static int gdf_start(struct ast_speech *speech)
 {
 	struct gdf_pvt *pvt = speech->data;
@@ -338,6 +413,10 @@ static int gdf_start(struct ast_speech *speech)
 	pvt->vad_state_duration = 0;
 	pvt->vad_change_duration = 0;
 	ast_mutex_unlock(&pvt->lock);
+
+	if (should_start_call_log(pvt)) {
+		start_call_log(pvt);
+	}
 	
 	if (!ast_strlen_zero(event)) {
 		if (df_recognize_event(pvt->session, event, language)) {
@@ -726,7 +805,7 @@ static int load_config(int reload)
 			}
 		}
 
-		ast_string_field_set(conf, call_log_location, "/var/log/dialogflow/${CONTEXT}/${STRFTIME(,,%%Y/%%m/%%d/%%H)}/");
+		ast_string_field_set(conf, call_log_location, "/var/log/dialogflow/${CONTEXT}/${STRFTIME(,,%Y/%m/%d/%H)}/");
 		val = ast_variable_retrieve(cfg, "general", "call_log_location");
 		if (!ast_strlen_zero(val)) {
 			ast_string_field_set(conf, call_log_location, val);
