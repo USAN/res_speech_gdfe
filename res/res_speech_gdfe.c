@@ -54,6 +54,11 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <stdarg.h>
+
+#ifndef ASTERISK_13_OR_LATER
+#include <jansson.h>
+#endif
 
 #define GDF_PROP_SESSION_ID_NAME	"session_id"
 #define GDF_PROP_PROJECT_ID_NAME	"project_id"
@@ -84,6 +89,7 @@ struct gdf_pvt {
 	FILE *call_log_file_handle;
 	
 	AST_DECLARE_STRING_FIELDS(
+		AST_STRING_FIELD(project_id);
 		AST_STRING_FIELD(session_id);
 		AST_STRING_FIELD(event);
 		AST_STRING_FIELD(language);
@@ -110,7 +116,14 @@ struct gdf_config {
 	);
 };
 
+enum gdf_call_log_type {
+	CALL_LOG_TYPE_SESSION,
+	CALL_LOG_TYPE_ENDPOINTER,
+	CALL_LOG_TYPE_DIALOGFLOW
+};
+
 static struct gdf_config *gdf_get_config(void);
+static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type, const char *event, ...);
 
 #ifdef ASTERISK_13_OR_LATER
 typedef struct ast_format *local_ast_format_t;
@@ -233,6 +246,11 @@ static int calculate_audio_level(const char *mulaw, int len)
 	return sum / len;
 }
 
+static void write_end_of_recognition_call_event(struct gdf_pvt *pvt)
+{
+	gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "end", NULL);
+}
+
 /* speech structure is locked */
 static int gdf_write(struct ast_speech *speech, void *data, int len)
 {
@@ -327,6 +345,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 		if (state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
 			df_stop_recognition(pvt->session);
 			ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
+			write_end_of_recognition_call_event(pvt);
 		}
 	}
 
@@ -404,10 +423,12 @@ static int gdf_start(struct ast_speech *speech)
 	struct gdf_pvt *pvt = speech->data;
 	char *event = NULL;
 	char *language = NULL;
+	char *project_id = NULL;
 
 	ast_mutex_lock(&pvt->lock);
 	event = ast_strdupa(pvt->event);
 	language = ast_strdupa(pvt->language);
+	project_id = ast_strdupa(pvt->project_id);
 	ast_string_field_set(pvt, event, "");
 	pvt->vad_state = VAD_STATE_START;
 	pvt->vad_state_duration = 0;
@@ -417,6 +438,8 @@ static int gdf_start(struct ast_speech *speech)
 	if (should_start_call_log(pvt)) {
 		start_call_log(pvt);
 	}
+
+	gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "start", "event", event, "language", language, "project_id", project_id, NULL);
 	
 	if (!ast_strlen_zero(event)) {
 		if (df_recognize_event(pvt->session, event, language)) {
@@ -450,6 +473,7 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 			ast_log(LOG_WARNING, "Project ID must have a value, refusing to set to nothing (remains %s)\n", df_get_project_id(pvt->session));
 			return -1;
 		}
+		ast_string_field_set(pvt, project_id, value);
 		df_set_project_id(pvt->session, value);
 	} else if (!strcasecmp(name, GDF_PROP_LANGUAGE_NAME)) {
 		ast_mutex_lock(&pvt->lock);
@@ -891,6 +915,77 @@ static struct ast_cli_entry gdfe_cli[] = {
 	AST_CLI_DEFINE(gdfe_reload, "Reload gdfe configuration"),
 	AST_CLI_DEFINE(gdfe_show_config, "Show current gdfe configuration"),
 };
+
+static int call_log_enabled_for_pvt(struct gdf_pvt *pvt)
+{
+	struct gdf_config *config;
+	int log_enabled = 0;
+	
+	config = gdf_get_config();
+	if (config) {
+		log_enabled = config->enable_call_logs;
+		if (log_enabled) {
+			ast_mutex_lock(&pvt->lock);
+			log_enabled = (pvt->call_log_file_handle != NULL);
+			ast_mutex_unlock(&pvt->lock);
+		}
+
+		ao2_t_ref(config, -1, "done with config in log check");
+	}
+	return log_enabled;
+}
+
+#ifndef ASTERISK_13_OR_LATER
+#define AST_ISO8601_LEN	29
+#endif
+
+AST_THREADSTORAGE(call_log_event);
+static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type, const char *event, ...)
+{
+	struct timeval timeval_now;
+	struct ast_tm tm_now = {};
+	char char_now[AST_ISO8601_LEN];
+	const char *char_type;
+	char *log_line;
+	char *name;
+	va_list args;
+	struct ast_str *log_message = ast_str_thread_get(&call_log_event, 512);
+
+	if (!call_log_enabled_for_pvt(pvt)) {
+		return;
+	}
+    
+	timeval_now = ast_tvnow();
+	ast_localtime(&timeval_now, &tm_now, NULL);
+
+	ast_strftime(char_now, sizeof(char_now), "%FT%TZ", &tm_now);
+
+	if (type == CALL_LOG_TYPE_SESSION) {
+		char_type = "SESSION";
+	} else if (type == CALL_LOG_TYPE_ENDPOINTER) {
+		char_type = "ENDPOINTER";
+	} else if (type == CALL_LOG_TYPE_DIALOGFLOW) {
+		char_type = "DIALOGFLOW";
+	} else {
+		char_type = "UNKNOWN";
+	}
+
+	ast_str_set(&log_message, 0, "{\"log_timestamp\":\"%s\",\"log_type\":\"%s\",\"log_event\":\"%s\"", char_now, char_type, event);
+
+	va_start(args, event);
+	while ((name = va_arg(args, char *)))
+	{
+		char *value = va_arg(args, char *);
+		ast_str_append(&log_message, 0, ",\"%s\":\"%s\"", name, value);
+	}
+	va_end(args);
+
+	ast_str_append(&log_message, 0, "}");
+
+	ast_mutex_lock(&pvt->lock);
+	fprintf(pvt->call_log_file_handle, "%s\n", log_line);
+	ast_mutex_unlock(&pvt->lock);
+}
 
 
 static void gdf_log(enum dialogflow_log_level level, const char *file, int line, const char *function, const char *fmt, va_list args)
