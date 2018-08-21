@@ -63,6 +63,7 @@
 #define GDF_PROP_SESSION_ID_NAME	"session_id"
 #define GDF_PROP_PROJECT_ID_NAME	"project_id"
 #define GDF_PROP_LANGUAGE_NAME		"language"
+#define GDF_PROP_LOG_CONTEXT		"log_context"
 #define VAD_PROP_VOICE_THRESHOLD	"voice_threshold"
 #define VAD_PROP_VOICE_DURATION		"voice_duration"
 #define VAD_PROP_SILENCE_DURATION	"silence_duration"
@@ -507,6 +508,10 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 	} else if (!strcasecmp(name, GDF_PROP_LANGUAGE_NAME)) {
 		ast_mutex_lock(&pvt->lock);
 		ast_string_field_set(pvt, language, value);
+		ast_mutex_unlock(&pvt->lock);
+	} else if (!strcasecmp(name, GDF_PROP_LOG_CONTEXT)) {
+		ast_mutex_lock(&pvt->lock);
+		ast_string_field_set(pvt, log_context, value);
 		ast_mutex_unlock(&pvt->lock);
 	} else if (!strcasecmp(name, VAD_PROP_VOICE_THRESHOLD)) {
 		int i;
