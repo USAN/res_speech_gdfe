@@ -54,7 +54,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <stdarg.h>
 
 #ifndef ASTERISK_13_OR_LATER
 #include <jansson.h>
@@ -124,7 +123,8 @@ enum gdf_call_log_type {
 };
 
 static struct gdf_config *gdf_get_config(void);
-static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type, const char *event, ...);
+static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type, const char *event, size_t log_data_size, const struct dialogflow_log_data *log_data);
+#define gdf_log_call_event_only(pvt, type, event)       gdf_log_call_event(pvt, type, event, 0, NULL)
 
 #ifdef ASTERISK_13_OR_LATER
 typedef struct ast_format *local_ast_format_t;
@@ -152,7 +152,7 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 
 	cfg = gdf_get_config();
 
-	pvt->session = df_create_session(cfg->endpoint, cfg->service_key);
+	pvt->session = df_create_session(cfg->endpoint, cfg->service_key, pvt);
 
 	if (!pvt->session) {
 		ast_log(LOG_WARNING, "Error creating session for GDF\n");
@@ -249,7 +249,7 @@ static int calculate_audio_level(const char *mulaw, int len)
 
 static void write_end_of_recognition_call_event(struct gdf_pvt *pvt)
 {
-	gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "end", NULL);
+	gdf_log_call_event_only(pvt, CALL_LOG_TYPE_SESSION, "end");
 }
 
 /* speech structure is locked */
@@ -302,7 +302,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 			vad_state = VAD_STATE_SPEAK;
 			change_duration = 0;
 			cur_duration = 0;
-			gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "start_of_speech");
+			gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "start_of_speech");
 		}
 	} else if (vad_state == VAD_STATE_SPEAK) {
 		if (change_duration >= silence_duration) {
@@ -311,7 +311,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 			vad_state = VAD_STATE_SILENT;
 			change_duration = 0;
 			cur_duration = 0;
-			gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "end_of_speech");
+			gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "end_of_speech");
 		}
 	}
 
@@ -328,7 +328,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 #endif
 
 	if (vad_state == VAD_STATE_SPEAK && orig_vad_state == VAD_STATE_START) {
-		if (df_start_recognition(pvt->session, pvt->language)) {
+		if (df_start_recognition(pvt->session, pvt->language, 0)) {
 			ast_log(LOG_WARNING, "Error starting recognition on %s\n", pvt->session_id);
 			ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
 		}
@@ -429,6 +429,11 @@ static void log_endpointer_start_event(struct gdf_pvt *pvt)
 	char voice_duration[11];
 	int pvt_silence_duration;
 	char silence_duration[11];
+	struct dialogflow_log_data log_data[] = {
+		{ VAD_PROP_VOICE_THRESHOLD, threshold },
+		{ VAD_PROP_VOICE_DURATION, voice_duration },
+		{ VAD_PROP_SILENCE_DURATION, silence_duration },
+	};
 
 	ast_mutex_lock(&pvt->lock);
 	pvt_threshold = pvt->voice_threshold;
@@ -440,11 +445,7 @@ static void log_endpointer_start_event(struct gdf_pvt *pvt)
 	sprintf(voice_duration, "%d", pvt_voice_duration);
 	sprintf(silence_duration, "%d", pvt_silence_duration);
 
-	gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "start", 
-		VAD_PROP_VOICE_THRESHOLD, threshold,
-		VAD_PROP_VOICE_DURATION, voice_duration,
-		VAD_PROP_SILENCE_DURATION, silence_duration,
-		NULL);
+	gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "start", ARRAY_LEN(log_data), log_data);
 }
 
 static int gdf_start(struct ast_speech *speech)
@@ -468,11 +469,18 @@ static int gdf_start(struct ast_speech *speech)
 		start_call_log(pvt);
 	}
 
-	gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "start", "event", event, "language", language, "project_id", project_id, NULL);
+	{
+		struct dialogflow_log_data log_data[] = {
+			{ "event", event },
+			{ "language", language },
+			{ "project_id", project_id }
+		};
+		gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "start", ARRAY_LEN(log_data), log_data);
+	}
 	log_endpointer_start_event(pvt);
 	
 	if (!ast_strlen_zero(event)) {
-		if (df_recognize_event(pvt->session, event, language)) {
+		if (df_recognize_event(pvt->session, event, language, 0)) {
 			ast_log(LOG_WARNING, "Error recognizing event on %s\n", pvt->session_id);
 			ast_speech_change_state(speech, AST_SPEECH_STATE_NOT_READY);
 		} else {
@@ -511,7 +519,7 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 		ast_mutex_unlock(&pvt->lock);
 	} else if (!strcasecmp(name, GDF_PROP_LOG_CONTEXT)) {
 		ast_mutex_lock(&pvt->lock);
-		ast_string_field_set(pvt, log_context, value);
+		ast_string_field_set(pvt, call_logging_context, value);
 		ast_mutex_unlock(&pvt->lock);
 	} else if (!strcasecmp(name, VAD_PROP_VOICE_THRESHOLD)) {
 		int i;
@@ -973,17 +981,19 @@ static int call_log_enabled_for_pvt(struct gdf_pvt *pvt)
 #define AST_ISO8601_LEN	29
 #endif
 
-AST_THREADSTORAGE(call_log_event);
-static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type, const char *event, ...)
+static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type, const char *event, size_t log_data_size, const struct dialogflow_log_data *log_data)
 {
 	struct timeval timeval_now;
 	struct ast_tm tm_now = {};
 	char char_now[AST_ISO8601_LEN];
 	const char *char_type;
 	char *log_line;
-	char *name;
-	va_list args;
-	struct ast_str *log_message = ast_str_thread_get(&call_log_event, 512);
+	size_t i;
+#ifdef ASTERISK_13_OR_LATER
+	RAII_VAR(struct ast_json *, log_message, ast_json_object_create(), ast_json_unref);
+#else
+	json_t *log_message;
+#endif
 
 	if (!call_log_enabled_for_pvt(pvt)) {
 		return;
@@ -1004,25 +1014,38 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 		char_type = "UNKNOWN";
 	}
 
-	ast_str_set(&log_message, 0, "{\"log_timestamp\":\"%s\",\"log_type\":\"%s\",\"log_event\":\"%s\"", char_now, char_type, event);
-
-	va_start(args, event);
-	while ((name = va_arg(args, char *)))
-	{
-		char *value = va_arg(args, char *);
-		ast_str_append(&log_message, 0, ",\"%s\":\"%s\"", name, value);
+#ifdef ASTERISK_13_OR_LATER
+	ast_json_object_set(log_message, "log_timestamp", ast_json_string_create(char_now));
+	ast_json_object_set(log_message, "log_type", ast_json_string_create(char_type));
+	ast_json_object_set(log_message, "log_event", ast_json_string_create(event));
+	for (i = 0; i < log_data_size; i++) {
+		ast_json_object_set(log_message, log_data[i].name, ast_json_string_create(log_data[i].value));
 	}
-	va_end(args);
-
-	ast_str_append(&log_message, 0, "}");
+	log_line = ast_json_dump_string(log_message);
+#else
+	log_message = json_object();
+	json_object_set_new(log_message, "log_timestamp", json_string(char_now));
+	json_object_set_new(log_message, "log_type", json_string(char_type));
+	json_object_set_new(log_message, "log_event", json_string(event));
+	for (i = 0; i < log_data_size; i++) {
+		json_object_set_new(log_message, log_data[i].name, json_string(log_data[i].value));
+	}
+	log_line = json_dumps(log_message, JSON_COMPACT);
+#endif
 
 	ast_mutex_lock(&pvt->lock);
 	fprintf(pvt->call_log_file_handle, "%s\n", log_line);
 	ast_mutex_unlock(&pvt->lock);
+
+#ifdef ASTERISK_13_OR_LATER
+	ast_json_free(log_line);
+#else
+	json_decref(log_message);
+	ast_free(log_line);
+#endif
 }
 
-
-static void gdf_log(enum dialogflow_log_level level, const char *file, int line, const char *function, const char *fmt, va_list args)
+static void libdialogflow_general_logging_callback(enum dialogflow_log_level level, const char *file, int line, const char *function, const char *fmt, va_list args)
 {
 	char *buff;
 	va_list args2;
@@ -1033,6 +1056,12 @@ static void gdf_log(enum dialogflow_log_level level, const char *file, int line,
     vsnprintf(buff, len + 1, fmt, args);
 
 	ast_log((int) level, file, line, function, "%s", buff);
+}
+
+static void libdialogflow_call_logging_callback(void *user_data, const char *event, size_t log_data_size, const struct dialogflow_log_data *data)
+{
+	struct gdf_pvt *pvt = (struct gdf_pvt *) user_data;
+	gdf_log_call_event(pvt, CALL_LOG_TYPE_DIALOGFLOW, event, log_data_size, data);
 }
 
 static char gdf_engine_name[] = "GoogleDFE";
@@ -1100,7 +1129,7 @@ static enum ast_module_load_result load_module(void)
 		return AST_MODULE_LOAD_FAILURE;
 	}
 
-	if (df_init(gdf_log)) {
+	if (df_init(libdialogflow_general_logging_callback, libdialogflow_call_logging_callback)) {
 		ast_log(LOG_WARNING, "Failed to initialize dialogflow library\n");
 		ao2_ref(config, -1);
 		return AST_MODULE_LOAD_FAILURE;
