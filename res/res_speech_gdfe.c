@@ -233,12 +233,12 @@ static int gdf_deactivate(struct ast_speech *speech, const char *grammar_name)
 	return 0;
 }
 
-static int calculate_audio_level(const char *mulaw, int len)
+static int calculate_audio_level(const short *slin, int len)
 {
 	int i;
 	long long sum = 0;
 	for (i = 0; i < len; i++) {
-		short sample = AST_MULAW((int)mulaw[i]);
+		short sample = slin[i];
 		sum += abs(sample);
 	}
 #ifdef RES_SPEECH_GDFE_DEBUG_VAD
@@ -266,6 +266,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	int voice_duration;
 	int silence_duration;
 	int datams;
+	int datasamples;
 
 	ast_mutex_lock(&pvt->lock);
 	orig_vad_state = vad_state = pvt->vad_state;
@@ -276,12 +277,12 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	silence_duration = pvt->silence_minimum_duration;
 	ast_mutex_unlock(&pvt->lock);
 
-	datams = len / 8; /* 8 samples per millisecond */
+	datasamples = len / sizeof(short); /* 2 bytes per sample for slin */
+	datams = datasamples / 8; /* 8 samples per millisecond */
 
 	cur_duration += datams;
 
-	/* we ask for mulaw -- if we ever get slin make sure to change this */
-	avg_level = calculate_audio_level((char *)data, len);
+	avg_level = calculate_audio_level((short *)data, len);
 	if (avg_level >= threshold) {
 		if (vad_state != VAD_STATE_SPEAK) {
 			change_duration += datams;
@@ -335,10 +336,18 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	}
 
 	if (vad_state != VAD_STATE_START) {
+		int mulaw_len = datasamples * sizeof(char);
+		char *mulaw = alloca(mulaw_len);
+		int i;
+
+		for (i = 0; i < datasamples; i++) {
+			mulaw[i] = AST_LIN2MU(((short *)data)[i]);
+		}
+
 		if (option_debug >= 5) {
 			ast_log(LOG_DEBUG, "Writing audio to dfe\n");
 		}
-		state = df_write_audio(pvt->session, data, len);
+		state = df_write_audio(pvt->session, mulaw, mulaw_len);
 
 		if (!ast_test_flag(speech, AST_SPEECH_QUIET) && df_get_response_count(pvt->session) > 0) {
 			ast_set_flag(speech, AST_SPEECH_QUIET);
@@ -1120,7 +1129,7 @@ static enum ast_module_load_result load_module(void)
 
 	ast_format_cap_append(gdf_engine.formats, ast_format_ulaw, 20);
 #else
-	gdf_engine.formats = AST_FORMAT_ULAW;
+	gdf_engine.formats = AST_FORMAT_SLINEAR;
 #endif
 
 	if (ast_speech_register(&gdf_engine)) {
