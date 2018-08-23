@@ -212,18 +212,69 @@ static int gdf_unload(struct ast_speech *speech, const char *grammar_name)
 	return 0;
 }
 
+#define EVENT_COLON_LEN	6
+#define EVENT_COLON		"event:"
+static int is_grammar_old_style_event(const char *grammar_name)
+{
+	return !strncasecmp(grammar_name, EVENT_COLON, EVENT_COLON_LEN);
+}
+
+static void activate_old_style_event(struct gdf_pvt *pvt, const char *grammar_name)
+{
+	const char *name = grammar_name + EVENT_COLON_LEN;
+	ast_log(LOG_DEBUG, "Activating event %s on %s\n", name, pvt->session_id);
+	ast_mutex_lock(&pvt->lock);
+	ast_string_field_set(pvt, event, name);
+	ast_mutex_unlock(&pvt->lock);
+}
+
+#define BUILTIN_COLON_GRAMMAR_SLASH_LEN	16
+#define BUILTIN_COLON_GRAMMAR_SLASH		"builtin:grammar/"
+static int is_grammar_new_style_format(const char *grammar_name)
+{
+	return !strncasecmp(grammar_name, BUILTIN_COLON_GRAMMAR_SLASH, BUILTIN_COLON_GRAMMAR_SLASH_LEN);
+}
+
+static void activate_new_style_grammar(struct gdf_pvt *pvt, const char *grammar_name)
+{
+	const char *name_part = grammar_name + BUILTIN_COLON_GRAMMAR_SLASH_LEN;
+	const char *event_part = "";
+	size_t name_len;
+	const char *question_mark;
+	if ((question_mark = strchr(name_part, '?'))) {
+		name_len = question_mark - name_part;
+		event_part = question_mark + 1;
+	} else {
+		name_len = strlen(name_part);
+	}
+
+	ast_mutex_lock(&pvt->lock);
+	ast_string_field_build(pvt, project_id, "%.*s", (int) name_len, name_part);
+	ast_string_field_set(pvt, event, event_part);
+	ast_mutex_unlock(&pvt->lock);
+	df_set_project_id(pvt->session, pvt->project_id);
+	if (!ast_strlen_zero(event_part)) {
+		ast_log(LOG_DEBUG, "Activating project %s, event %s on %s\n", 
+			pvt->project_id, pvt->event, pvt->session_id);
+	} else {
+		ast_log(LOG_DEBUG, "Activating project %s on %s\n", pvt->project_id,
+			pvt->session_id);
+	}
+}
+
 /** activate is used in this context to prime DFE with an event for 'detection'
  * 	this is typically used when starting up (e.g. event:welcome)
  */
 static int gdf_activate(struct ast_speech *speech, const char *grammar_name)
 {
 	struct gdf_pvt *pvt = speech->data;
-	if (!strncasecmp(grammar_name, "event:", 6)) {
-		const char *name = grammar_name + 6;
-		ast_log(LOG_DEBUG, "Activating event %s on %s\n", name, pvt->session_id);
-		ast_mutex_lock(&pvt->lock);
-		ast_string_field_set(pvt, event, name);
-		ast_mutex_unlock(&pvt->lock);
+	if (is_grammar_old_style_event(grammar_name)) {
+		activate_old_style_event(pvt, grammar_name);
+	} else if (is_grammar_new_style_format(grammar_name)) {
+		activate_new_style_grammar(pvt, grammar_name);
+	} else {
+		ast_log(LOG_WARNING, "Do not understand grammar name %s on %s\n", grammar_name, pvt->session_id);
+		return -1;
 	}
 	return 0;
 }
@@ -520,7 +571,9 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 			ast_log(LOG_WARNING, "Project ID must have a value, refusing to set to nothing (remains %s)\n", df_get_project_id(pvt->session));
 			return -1;
 		}
+		ast_mutex_lock(&pvt->lock);
 		ast_string_field_set(pvt, project_id, value);
+		ast_mutex_unlock(&pvt->lock);
 		df_set_project_id(pvt->session, value);
 	} else if (!strcasecmp(name, GDF_PROP_LANGUAGE_NAME)) {
 		ast_mutex_lock(&pvt->lock);
