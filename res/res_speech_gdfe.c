@@ -886,6 +886,12 @@ static int load_config(int reload)
 			ast_string_field_set(conf, call_log_location, val);
 		}
 
+		conf->enable_call_logs = 0;
+		val = ast_variable_retrieve(cfg, "general", "enable_call_logs");
+		if (!ast_strlen_zero(val)) {
+			conf->enable_call_logs = ast_true(val);
+		}
+
 		/* swap out the configs */
 #ifdef ASTERISK_13_OR_LATER
 		ao2_wrlock(config);
