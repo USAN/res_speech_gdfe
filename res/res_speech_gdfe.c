@@ -87,6 +87,13 @@ struct gdf_pvt {
 
 	int call_log_open_already_attempted;
 	FILE *call_log_file_handle;
+
+	int utterance_counter;
+
+	int utterance_preendpointer_recording_open_already_attempted;
+	FILE *utterance_preendpointer_recording_file_handle;
+	int utterance_postendpointer_recording_open_already_attempted;
+	FILE *utterance_postendpointer_recording_file_handle;
 	
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(project_id);
@@ -96,6 +103,7 @@ struct gdf_pvt {
 		AST_STRING_FIELD(lastAudioResponse);
 
 		AST_STRING_FIELD(call_log_path);
+		AST_STRING_FIELD(call_log_file_basename);
 		AST_STRING_FIELD(call_logging_context);
 	);
 };
@@ -108,6 +116,8 @@ struct gdf_config {
 	int vad_silence_minimum_duration;
 
 	int enable_call_logs;
+	int enable_preendpointer_recordings;
+	int enable_postendpointer_recordings;
 
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(service_key);
@@ -125,6 +135,8 @@ enum gdf_call_log_type {
 static struct gdf_config *gdf_get_config(void);
 static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type, const char *event, size_t log_data_size, const struct dialogflow_log_data *log_data);
 #define gdf_log_call_event_only(pvt, type, event)       gdf_log_call_event(pvt, type, event, 0, NULL)
+
+static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf_pvt *pvt, int include_utterance_counter, const char *type, const char *extension);
 
 #ifdef ASTERISK_13_OR_LATER
 typedef struct ast_format *local_ast_format_t;
@@ -303,6 +315,171 @@ static void write_end_of_recognition_call_event(struct gdf_pvt *pvt)
 	gdf_log_call_event_only(pvt, CALL_LOG_TYPE_SESSION, "end");
 }
 
+static int are_currently_recording_pre_endpointed_audio(struct gdf_pvt *pvt)
+{
+	int are_recording;
+	ast_mutex_lock(&pvt->lock);
+	are_recording = (pvt->utterance_preendpointer_recording_file_handle != NULL);
+	ast_mutex_unlock(&pvt->lock);
+	return are_recording;
+}
+
+static int open_preendpointed_recording_file(struct gdf_pvt *pvt)
+{
+	struct ast_str *path = build_log_related_filename_to_thread_local_str(pvt, 1, "pre", "ul");
+	FILE *record_file;
+
+	ast_mutex_lock(&pvt->lock);
+	pvt->utterance_preendpointer_recording_open_already_attempted = 1;
+	ast_mutex_unlock(&pvt->lock);
+
+	record_file = fopen(ast_str_buffer(path), "w");
+	if (record_file) {
+		struct dialogflow_log_data log_data[] = {
+			{ "filename", ast_str_buffer(path) }
+		};
+		gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "pre_recording_start", ARRAY_LEN(log_data), log_data);
+		ast_log(LOG_DEBUG, "Opened %s for preendpointer recording for %s\n", ast_str_buffer(path), pvt->session_id);
+		ast_mutex_lock(&pvt->lock);
+		pvt->utterance_preendpointer_recording_file_handle = record_file;
+		ast_mutex_unlock(&pvt->lock);
+	} else {
+		ast_log(LOG_WARNING, "Unable to open %s for preendpointer recording for %s -- %d: %s\n", ast_str_buffer(path), pvt->session_id, errno, strerror(errno));
+	}
+
+	return (record_file == NULL ? -1 : 0);
+}
+
+static int open_postendpointed_recording_file(struct gdf_pvt *pvt)
+{
+	struct ast_str *path = build_log_related_filename_to_thread_local_str(pvt, 1, "post", "ul");
+	FILE *record_file;
+
+	ast_mutex_lock(&pvt->lock);
+	pvt->utterance_postendpointer_recording_open_already_attempted = 1;
+	ast_mutex_unlock(&pvt->lock);
+
+	record_file = fopen(ast_str_buffer(path), "w");
+	if (record_file) {
+		struct dialogflow_log_data log_data[] = {
+			{ "filename", ast_str_buffer(path) }
+		};
+		gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "post_recording_start", ARRAY_LEN(log_data), log_data);
+		ast_log(LOG_DEBUG, "Opened %s for postendpointer recording for %s\n", ast_str_buffer(path), pvt->session_id);
+		ast_mutex_lock(&pvt->lock);
+		pvt->utterance_postendpointer_recording_file_handle = record_file;
+		ast_mutex_unlock(&pvt->lock);
+	} else {
+		ast_log(LOG_WARNING, "Unable to open %s for postendpointer recording for %s -- %d: %s\n", ast_str_buffer(path), pvt->session_id, errno, strerror(errno));
+	}
+
+	return (record_file == NULL ? -1 : 0);
+}
+
+static void maybe_record_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mulaw_len, enum VAD_STATE current_vad_state)
+{
+	struct gdf_config *config = gdf_get_config();
+	int enable_preendpointer_recordings = 0;
+	int enable_postendpointer_recordings = 0;
+	int currently_recording_preendpointed_audio = 0;
+	int currently_recording_postendpointed_audio = 0;
+	int already_attempted_open_for_preendpointed_audio = 0;
+	int already_attempted_open_for_postendpointed_audio = 0;
+
+	if (config) {
+		enable_preendpointer_recordings = config->enable_preendpointer_recordings;
+		enable_postendpointer_recordings = config->enable_postendpointer_recordings;		
+		ao2_t_ref(config, -1, "done with config checking for recording");
+	}
+
+	if (enable_postendpointer_recordings || enable_preendpointer_recordings) {
+		int have_call_log_path;
+		ast_mutex_lock(&pvt->lock);
+		have_call_log_path = !ast_strlen_zero(pvt->call_log_path);
+		if (have_call_log_path) {
+			currently_recording_preendpointed_audio = (pvt->utterance_preendpointer_recording_file_handle != NULL);
+			already_attempted_open_for_preendpointed_audio = pvt->utterance_preendpointer_recording_open_already_attempted;
+			currently_recording_postendpointed_audio = (pvt->utterance_postendpointer_recording_file_handle != NULL);
+			already_attempted_open_for_postendpointed_audio = pvt->utterance_postendpointer_recording_open_already_attempted;
+		}
+		ast_mutex_unlock(&pvt->lock);
+	}
+
+	if (enable_preendpointer_recordings) {
+		if (!currently_recording_preendpointed_audio && !already_attempted_open_for_preendpointed_audio) {
+			if (!open_preendpointed_recording_file(pvt)) {
+				currently_recording_preendpointed_audio = 1;
+			}
+		}
+		if (currently_recording_preendpointed_audio) {
+			size_t written = fwrite(mulaw, sizeof(char), mulaw_len, pvt->utterance_preendpointer_recording_file_handle);
+			if (written < mulaw_len) {
+				ast_log(LOG_WARNING, "Only wrote %d of %d bytes for pre-endpointed recording for %s\n",
+					(int) written, (int) mulaw_len, pvt->session_id);
+			}
+		}
+	}
+
+	if (enable_postendpointer_recordings && current_vad_state == VAD_STATE_SPEAK) {
+		if (!currently_recording_postendpointed_audio && !already_attempted_open_for_postendpointed_audio) {
+			if (!open_postendpointed_recording_file(pvt)) {
+				currently_recording_postendpointed_audio = 1;
+			}
+		}
+		if (currently_recording_postendpointed_audio) {
+			size_t written = fwrite(mulaw, sizeof(char), mulaw_len, pvt->utterance_postendpointer_recording_file_handle);
+			if (written < mulaw_len) {
+				ast_log(LOG_WARNING, "Only wrote %d of %d bytes for post-endpointed recording for %s\n",
+					(int) written, (int) mulaw_len, pvt->session_id);
+			}
+		}
+	}
+}
+
+static void close_preendpointed_audio_recording(struct gdf_pvt *pvt)
+{
+	ast_mutex_lock(&pvt->lock);
+	if (pvt->utterance_preendpointer_recording_file_handle) {
+		fclose(pvt->utterance_preendpointer_recording_file_handle);
+		pvt->utterance_preendpointer_recording_file_handle = NULL;
+	}
+	ast_mutex_unlock(&pvt->lock);
+	gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "pre_recording_stop");
+}
+
+static void close_postendpointed_audio_recording(struct gdf_pvt *pvt)
+{
+	ast_mutex_lock(&pvt->lock);
+	if (pvt->utterance_postendpointer_recording_file_handle) {
+		fclose(pvt->utterance_postendpointer_recording_file_handle);
+		pvt->utterance_postendpointer_recording_file_handle = NULL;
+	}
+	ast_mutex_unlock(&pvt->lock);
+	gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "post_recording_stop");
+}
+
+static int gdf_stop_recognition(struct ast_speech *speech, struct gdf_pvt *pvt)
+{
+	ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
+	write_end_of_recognition_call_event(pvt);
+	close_preendpointed_audio_recording(pvt);
+	close_postendpointed_audio_recording(pvt);
+	return 0;
+}
+
+#define MAX_DEBUG_LEN	350
+static char *gdf_hexdump(unsigned char buf[], int size, char *s /* destination */)
+{
+	char *p;
+	int f;
+
+	for (p = s, f = 0; f < size && f < MAX_DEBUG_LEN; f++, p += 3) {
+		sprintf(p, "%02X ", (unsigned char)buf[f]);
+	}
+	return(s);
+}
+
+
 /* speech structure is locked */
 static int gdf_write(struct ast_speech *speech, void *data, int len)
 {
@@ -382,7 +559,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	if (vad_state == VAD_STATE_SPEAK && orig_vad_state == VAD_STATE_START) {
 		if (df_start_recognition(pvt->session, pvt->language, 0)) {
 			ast_log(LOG_WARNING, "Error starting recognition on %s\n", pvt->session_id);
-			ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
+			gdf_stop_recognition(speech, pvt);
 		}
 	}
 
@@ -395,21 +572,29 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 			mulaw[i] = AST_LIN2MU(((short *)data)[i]);
 		}
 
-		if (option_debug >= 5) {
-			ast_log(LOG_DEBUG, "Writing audio to dfe\n");
-		}
+		maybe_record_audio(pvt, mulaw, mulaw_len, vad_state);
+
 		state = df_write_audio(pvt->session, mulaw, mulaw_len);
 
-		if (!ast_test_flag(speech, AST_SPEECH_QUIET) && df_get_response_count(pvt->session) > 0) {
+		if (!ast_test_flag(speech, AST_SPEECH_SPOKE) && df_get_response_count(pvt->session) > 0) {
 			ast_set_flag(speech, AST_SPEECH_QUIET);
 			ast_set_flag(speech, AST_SPEECH_SPOKE);
 		}
 
 		if (state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
 			df_stop_recognition(pvt->session);
-			ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
-			write_end_of_recognition_call_event(pvt);
+			gdf_stop_recognition(speech, pvt);
 		}
+	} else if (are_currently_recording_pre_endpointed_audio(pvt)) {
+		int mulaw_len = datasamples * sizeof(char);
+		char *mulaw = alloca(mulaw_len);
+		int i;
+
+		for (i = 0; i < datasamples; i++) {
+			mulaw[i] = AST_LIN2MU(((short *)data)[i]);
+		}
+
+		maybe_record_audio(pvt, mulaw, mulaw_len, vad_state);
 	}
 
 	return 0;
@@ -437,9 +622,8 @@ static int should_start_call_log(struct gdf_pvt *pvt)
 	return should_start;
 }
 
-
 AST_THREADSTORAGE(call_log_path);
-static void start_call_log(struct gdf_pvt *pvt)
+static void calculate_log_path(struct gdf_pvt *pvt)
 {
 	struct varshead var_head = { .first = NULL, .last = NULL };
 	struct ast_var_t *var;
@@ -447,21 +631,73 @@ static void start_call_log(struct gdf_pvt *pvt)
 
 	ast_mutex_lock(&pvt->lock);
 	var = ast_var_assign("CONTEXT", pvt->call_logging_context);
-	pvt->call_log_open_already_attempted = 1;
 	ast_mutex_unlock(&pvt->lock);
 
 	AST_LIST_INSERT_HEAD(&var_head, var, entries);
 
 	cfg = gdf_get_config();
 	if (cfg) {
-		FILE *log_file;
 		struct ast_str *path = ast_str_thread_get(&call_log_path, 256);
 
 		ast_str_substitute_variables_varshead(&path, 0, &var_head, cfg->call_log_location);
 
-		ast_mkdir(ast_str_buffer(path), 0644);
+		ast_mutex_lock(&pvt->lock);
+		ast_string_field_set(pvt, call_log_path, ast_str_buffer(path));
+		ast_mutex_unlock(&pvt->lock);
 
-		ast_str_append(&path, 0, "%s.LOG", pvt->session_id);
+		ao2_t_ref(cfg, -1, "done with config in calculating call log path");
+	}
+	
+	ast_var_delete(var);
+}
+
+static void calculate_log_file_basename(struct gdf_pvt *pvt)
+{
+	struct timeval t;
+	struct ast_tm now;
+	
+	t = ast_tvnow();
+	ast_localtime(&t, &now, NULL);
+	ast_string_field_build(pvt, call_log_file_basename, "%02d%02d_%s", now.tm_min, now.tm_sec, pvt->session_id);
+}
+
+static void mkdir_log_path(struct gdf_pvt *pvt)
+{
+	ast_mkdir(pvt->call_log_path, 0644);
+}
+
+static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf_pvt *pvt, int include_utterance_counter, const char *type, const char *extension)
+{
+	struct ast_str *path;
+	path = ast_str_thread_get(&call_log_path, 256);
+	ast_mutex_lock(&pvt->lock);
+	ast_str_set(&path, 0, pvt->call_log_path);
+	ast_str_append(&path, 0, pvt->call_log_file_basename);
+	ast_str_append(&path, 0, "_%s", type);
+	if (include_utterance_counter) {
+		ast_str_append(&path, 0, "_%d", pvt->utterance_counter);
+	}
+	ast_str_append(&path, 0, ".%s" , extension);
+	ast_mutex_unlock(&pvt->lock);
+	return path;
+}
+
+static void start_call_log(struct gdf_pvt *pvt)
+{
+	ast_mutex_lock(&pvt->lock);
+	pvt->call_log_open_already_attempted = 1;
+	ast_mutex_unlock(&pvt->lock);
+
+	calculate_log_path(pvt);
+	calculate_log_file_basename(pvt);
+
+	if (!ast_strlen_zero(pvt->call_log_path)) {
+		struct ast_str *path;
+		FILE *log_file;
+
+		mkdir_log_path(pvt);
+
+		path = build_log_related_filename_to_thread_local_str(pvt, 0, "log", "jsonl");
 
 		log_file = fopen(ast_str_buffer(path), "w");
 		if (log_file) {
@@ -472,13 +708,9 @@ static void start_call_log(struct gdf_pvt *pvt)
 		} else {
 			ast_log(LOG_WARNING, "Unable to open %s for writing call log for %s -- %d: %s\n", ast_str_buffer(path), pvt->session_id, errno, strerror(errno));
 		}
-
-		ao2_t_ref(cfg, -1, "done with config in starting call log");
 	} else {
-		ast_log(LOG_WARNING, "Not starting call log, unable to find configuration\n");
+		ast_log(LOG_WARNING, "Not starting call log, path is empty\n");
 	}
-
-	ast_var_delete(var);
 }
 
 static void log_endpointer_start_event(struct gdf_pvt *pvt)
@@ -523,6 +755,7 @@ static int gdf_start(struct ast_speech *speech)
 	pvt->vad_state = VAD_STATE_START;
 	pvt->vad_state_duration = 0;
 	pvt->vad_change_duration = 0;
+	pvt->utterance_counter++;
 	ast_mutex_unlock(&pvt->lock);
 
 	if (should_start_call_log(pvt)) {
@@ -530,11 +763,14 @@ static int gdf_start(struct ast_speech *speech)
 	}
 
 	{
+		char utterance_number[11];
 		struct dialogflow_log_data log_data[] = {
 			{ "event", event },
 			{ "language", language },
-			{ "project_id", project_id }
+			{ "project_id", project_id },
+			{ "utterance", utterance_number }
 		};
+		sprintf(utterance_number, "%d", pvt->utterance_counter);
 		gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "start", ARRAY_LEN(log_data), log_data);
 	}
 	log_endpointer_start_event(pvt);
@@ -544,7 +780,7 @@ static int gdf_start(struct ast_speech *speech)
 			ast_log(LOG_WARNING, "Error recognizing event on %s\n", pvt->session_id);
 			ast_speech_change_state(speech, AST_SPEECH_STATE_NOT_READY);
 		} else {
-			ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
+			gdf_stop_recognition(speech, pvt);
 		}
 	} else {
 		ast_speech_change_state(speech, AST_SPEECH_STATE_READY);
@@ -945,6 +1181,18 @@ static int load_config(int reload)
 			conf->enable_call_logs = ast_true(val);
 		}
 
+		conf->enable_preendpointer_recordings = 0;
+		val = ast_variable_retrieve(cfg, "general", "enable_preendpointer_recordings");
+		if (!ast_strlen_zero(val)) {
+			conf->enable_preendpointer_recordings = ast_true(val);
+		}
+
+		conf->enable_postendpointer_recordings = 0;
+		val = ast_variable_retrieve(cfg, "general", "enable_postendpointer_recordings");
+		if (!ast_strlen_zero(val)) {
+			conf->enable_postendpointer_recordings = ast_true(val);
+		}
+
 		/* swap out the configs */
 #ifdef ASTERISK_13_OR_LATER
 		ao2_wrlock(config);
@@ -1010,8 +1258,10 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "vad_voice_threshold = %d\n", config->vad_voice_threshold);
 			ast_cli(a->fd, "vad_voice_minimum_duration = %d\n", config->vad_voice_minimum_duration);
 			ast_cli(a->fd, "vad_silence_minimum_duration = %d\n", config->vad_silence_minimum_duration);
-			ast_cli(a->fd, "enable_call_logs = %s\n", AST_CLI_YESNO(config->enable_call_logs));
 			ast_cli(a->fd, "call_log_location = %s\n", config->call_log_location);
+			ast_cli(a->fd, "enable_call_logs = %s\n", AST_CLI_YESNO(config->enable_call_logs));
+			ast_cli(a->fd, "enable_preendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_preendpointer_recordings));
+			ast_cli(a->fd, "enable_postendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_postendpointer_recordings));
 			ao2_ref(config, -1);
 		} else {
 			ast_cli(a->fd, "Unable to retrieve configuration\n");
