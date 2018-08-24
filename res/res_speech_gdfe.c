@@ -467,19 +467,6 @@ static int gdf_stop_recognition(struct ast_speech *speech, struct gdf_pvt *pvt)
 	return 0;
 }
 
-#define MAX_DEBUG_LEN	350
-static char *gdf_hexdump(unsigned char buf[], int size, char *s /* destination */)
-{
-	char *p;
-	int f;
-
-	for (p = s, f = 0; f < size && f < MAX_DEBUG_LEN; f++, p += 3) {
-		sprintf(p, "%02X ", (unsigned char)buf[f]);
-	}
-	return(s);
-}
-
-
 /* speech structure is locked */
 static int gdf_write(struct ast_speech *speech, void *data, int len)
 {
