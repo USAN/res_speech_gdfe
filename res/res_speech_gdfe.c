@@ -60,9 +60,12 @@
 #endif
 
 #define GDF_PROP_SESSION_ID_NAME	"session_id"
+#define GDF_PROP_ALTERNATE_SESSION_NAME "name"
 #define GDF_PROP_PROJECT_ID_NAME	"project_id"
 #define GDF_PROP_LANGUAGE_NAME		"language"
 #define GDF_PROP_LOG_CONTEXT		"log_context"
+#define GDF_PROP_ALTERNATE_LOG_CONTEXT	"logContext"
+#define GDF_PROP_APPLICATION_CONTEXT	"application"
 #define VAD_PROP_VOICE_THRESHOLD	"voice_threshold"
 #define VAD_PROP_VOICE_DURATION		"voice_duration"
 #define VAD_PROP_SILENCE_DURATION	"silence_duration"
@@ -104,6 +107,7 @@ struct gdf_pvt {
 
 		AST_STRING_FIELD(call_log_path);
 		AST_STRING_FIELD(call_log_file_basename);
+		AST_STRING_FIELD(call_logging_application_name);
 		AST_STRING_FIELD(call_logging_context);
 	);
 };
@@ -179,7 +183,7 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	pvt->voice_threshold = cfg->vad_voice_threshold;
 	pvt->voice_minimum_duration = cfg->vad_voice_minimum_duration;
 	pvt->silence_minimum_duration = cfg->vad_silence_minimum_duration;
-	ast_string_field_set(pvt, call_logging_context, "unknown");
+	ast_string_field_set(pvt, call_logging_application_name, "unknown");
 
 	ast_mutex_lock(&speech->lock);
 	speech->state = AST_SPEECH_STATE_NOT_READY;
@@ -460,10 +464,10 @@ static void close_postendpointed_audio_recording(struct gdf_pvt *pvt)
 
 static int gdf_stop_recognition(struct ast_speech *speech, struct gdf_pvt *pvt)
 {
-	ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
-	write_end_of_recognition_call_event(pvt);
 	close_preendpointed_audio_recording(pvt);
 	close_postendpointed_audio_recording(pvt);
+	ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
+	write_end_of_recognition_call_event(pvt);
 	return 0;
 }
 
@@ -617,7 +621,7 @@ static void calculate_log_path(struct gdf_pvt *pvt)
 	struct gdf_config *cfg;
 
 	ast_mutex_lock(&pvt->lock);
-	var = ast_var_assign("CONTEXT", pvt->call_logging_context);
+	var = ast_var_assign("APPLICATION", pvt->call_logging_application_name);
 	ast_mutex_unlock(&pvt->lock);
 
 	AST_LIST_INSERT_HEAD(&var_head, var, entries);
@@ -755,7 +759,9 @@ static int gdf_start(struct ast_speech *speech)
 			{ "event", event },
 			{ "language", language },
 			{ "project_id", project_id },
-			{ "utterance", utterance_number }
+			{ "utterance", utterance_number },
+			{ "context", pvt->call_logging_context },
+			{ "application", pvt->call_logging_application_name }
 		};
 		sprintf(utterance_number, "%d", pvt->utterance_counter);
 		gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "start", ARRAY_LEN(log_data), log_data);
@@ -780,7 +786,7 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 {
 	struct gdf_pvt *pvt = speech->data;
 
-	if (!strcasecmp(name, GDF_PROP_SESSION_ID_NAME)) {
+	if (!strcasecmp(name, GDF_PROP_SESSION_ID_NAME) || !strcasecmp(name, GDF_PROP_ALTERNATE_SESSION_NAME)) {
 		if (ast_strlen_zero(value)) {
 			ast_log(LOG_WARNING, "Session ID must have a value, refusing to set to nothing (remains %s)\n", df_get_session_id(pvt->session));
 			return -1;
@@ -802,9 +808,13 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 		ast_mutex_lock(&pvt->lock);
 		ast_string_field_set(pvt, language, value);
 		ast_mutex_unlock(&pvt->lock);
-	} else if (!strcasecmp(name, GDF_PROP_LOG_CONTEXT)) {
+	} else if (!strcasecmp(name, GDF_PROP_LOG_CONTEXT) || !strcasecmp(name, GDF_PROP_ALTERNATE_LOG_CONTEXT)) {
 		ast_mutex_lock(&pvt->lock);
 		ast_string_field_set(pvt, call_logging_context, value);
+		ast_mutex_unlock(&pvt->lock);
+	} else if (!strcasecmp(name, GDF_PROP_APPLICATION_CONTEXT)) {
+		ast_mutex_lock(&pvt->lock);
+		ast_string_field_set(pvt, call_logging_application_name, value);
 		ast_mutex_unlock(&pvt->lock);
 	} else if (!strcasecmp(name, VAD_PROP_VOICE_THRESHOLD)) {
 		int i;
@@ -1156,7 +1166,7 @@ static int load_config(int reload)
 			}
 		}
 
-		ast_string_field_set(conf, call_log_location, "/var/log/dialogflow/${CONTEXT}/${STRFTIME(,,%Y/%m/%d/%H)}/");
+		ast_string_field_set(conf, call_log_location, "/var/log/dialogflow/${APPLICATION}/${STRFTIME(,,%Y/%m/%d/%H)}/");
 		val = ast_variable_retrieve(cfg, "general", "call_log_location");
 		if (!ast_strlen_zero(val)) {
 			ast_string_field_set(conf, call_log_location, val);
