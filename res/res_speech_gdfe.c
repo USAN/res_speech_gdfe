@@ -114,6 +114,13 @@ struct gdf_pvt {
 
 struct ao2_container *config;
 
+struct gdf_logical_agent {
+	const char *name;
+	const char *project_id;
+	const char *service_key;
+	char endpoint[0];
+};
+
 struct gdf_config {
 	int vad_voice_threshold;
 	int vad_voice_minimum_duration;
@@ -122,6 +129,8 @@ struct gdf_config {
 	int enable_call_logs;
 	int enable_preendpointer_recordings;
 	int enable_postendpointer_recordings;
+
+	struct ao2_container *logical_agents;
 
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(service_key);
@@ -137,6 +146,7 @@ enum gdf_call_log_type {
 };
 
 static struct gdf_config *gdf_get_config(void);
+static struct gdf_logical_agent *get_logical_agent_by_name(struct gdf_config *config, const char *name);
 static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type, const char *event, size_t log_data_size, const struct dialogflow_log_data *log_data);
 #define gdf_log_call_event_only(pvt, type, event)       gdf_log_call_event(pvt, type, event, 0, NULL)
 
@@ -1045,6 +1055,10 @@ static void gdf_config_destroy(void *o)
 	struct gdf_config *conf = o;
 
 	ast_string_field_free_memory(conf);
+
+	if (conf->logical_agents) {
+		ao2_ref(conf->logical_agents, -1);
+	}
 }
 
 static struct gdf_config *gdf_get_config(void)
@@ -1060,6 +1074,89 @@ static struct gdf_config *gdf_get_config(void)
 	return cfg;
 }
 
+static void logical_agent_destructor(void *obj)
+{
+	/* noop */
+}
+
+static struct gdf_logical_agent *logical_agent_alloc(const char *name, const char *project_id, const char *service_key, const char *endpoint)
+{
+	size_t name_len = strlen(name);
+	size_t project_id_len = strlen(project_id);
+	size_t service_key_len = strlen(service_key);
+	size_t endpoint_len = strlen(endpoint);
+	size_t space_needed = name_len + 1 +
+							project_id_len + 1 +
+							service_key_len + 1 +
+							endpoint_len + 1;
+	struct gdf_logical_agent *agent;
+	
+	agent = ao2_alloc(space_needed + sizeof(struct gdf_logical_agent), logical_agent_destructor);
+	if (agent) {
+		ast_copy_string(agent->endpoint, endpoint, endpoint_len + 1);
+		agent->service_key = agent->endpoint + endpoint_len + 1;
+		ast_copy_string((char *)agent->service_key, service_key, service_key_len + 1);
+		agent->project_id = agent->service_key + service_key_len + 1;
+		ast_copy_string((char *)agent->project_id, project_id, project_id_len + 1);
+		agent->name = agent->project_id + project_id_len + 1;
+		ast_copy_string((char *)agent->name, name, name_len + 1);
+	}
+
+	return agent;
+}
+
+static int logical_agent_hash_callback(const void *obj, const int flags)
+{
+	const struct gdf_logical_agent *agent = obj;
+	return ast_str_case_hash(agent->name);
+}
+
+static int logical_agent_compare_callback(void *obj, void *other, int flags)
+{
+	const struct gdf_logical_agent *agentA = obj;
+	const struct gdf_logical_agent *agentB = other;
+	return (!strcasecmp(agentA->name, agentB->name) ? CMP_MATCH | CMP_STOP : 0);
+}
+
+static struct gdf_logical_agent *get_logical_agent_by_name(struct gdf_config *config, const char *name)
+{
+	struct gdf_logical_agent tmpAgent = { .name = name };
+	return ao2_find(config->logical_agents, &tmpAgent, OBJ_POINTER);
+}
+
+static struct ast_str *load_service_key(const char *val)
+{
+	struct ast_str *buffer = ast_str_create(3 * 1024); /* big enough for the typical key size */
+	if (!buffer) {
+		ast_log(LOG_WARNING, "Memory allocation failure allocating ast_str for loading service key\n");
+		return NULL;
+	}
+
+	if (strchr(val, '{')) {
+		ast_str_set(&buffer, 0, val);
+	} else {
+		FILE *f;
+		ast_log(LOG_DEBUG, "Loading service key data from %s\n", val);
+		f = fopen(val, "r");
+		if (f) {
+			char readbuffer[512];
+			size_t read = fread(readbuffer, sizeof(char), sizeof(readbuffer), f);
+			while (read > 0) {
+				ast_str_append_substr(&buffer, 0, readbuffer, read);
+				read = fread(readbuffer, sizeof(char), sizeof(readbuffer), f);
+			}
+			if (ferror(f)) {
+				ast_log(LOG_WARNING, "Error reading %s -- %d\n", val, errno);
+			}
+			fclose(f);
+		} else {
+			ast_log(LOG_ERROR, "Unable to open service key file %s -- %d\n", val, errno);
+		}
+	}
+
+	return buffer;
+}
+
 #define CONFIGURATION_FILENAME		"res_speech_gdfe.conf"
 static int load_config(int reload)
 {
@@ -1072,6 +1169,7 @@ static int load_config(int reload)
 	} else {
 		struct gdf_config *conf;
 		const char *val;
+		const char *category;
 
 		if (cfg == CONFIG_STATUS_FILEINVALID) {
 			ast_log(LOG_WARNING, "Configuration file invalid\n");
@@ -1095,37 +1193,20 @@ static int load_config(int reload)
 			return AST_MODULE_LOAD_FAILURE;
 		}
 
+		conf->logical_agents = ao2_container_alloc(32, logical_agent_hash_callback, logical_agent_compare_callback);
+		if (!conf->logical_agents) {
+			ast_log(LOG_WARNING, "Failed to allocate logical agent container for speech gdf\n");
+			ao2_ref(conf, -1);
+			ast_config_destroy(cfg);
+		}
+
 		val = ast_variable_retrieve(cfg, "general", "service_key");
 		if (ast_strlen_zero(val)) {
 			ast_log(LOG_VERBOSE, "Service key not provided -- will use default credentials.\n");
-		} else if (strchr(val, '{')) {
-			ast_log(LOG_DEBUG, "service_key in configuration detected as an actual key\n");
-			ast_string_field_set(conf, service_key, val);
 		} else {
-			FILE *f;
-			ast_log(LOG_DEBUG, "Loading service key data from %s\n", val);
-			f = fopen(val, "r");
-			if (f) {
-				struct ast_str *buffer = ast_str_create(3 * 1024); /* big enough for the typical key size */
-				if (buffer) {
-					char readbuffer[512];
-					size_t read = fread(readbuffer, sizeof(char), sizeof(readbuffer), f);
-					while (read > 0) {
-						ast_str_append_substr(&buffer, -1, readbuffer, read);
-						read = fread(readbuffer, sizeof(char), sizeof(readbuffer), f);
-					}
-					if (ferror(f)) {
-						ast_log(LOG_WARNING, "Error reading %s -- %d\n", val, errno);
-					}
-					fclose(f);
-					ast_string_field_set(conf, service_key, ast_str_buffer(buffer));
-					ast_free(buffer);
-				} else {
-					ast_log(LOG_WARNING, "Unable to load key from %s -- buffer allocation error\n", val);
-				}
-			} else {
-				ast_log(LOG_ERROR, "Unable to open service key file %s -- %d\n", val, errno);
-			}
+			struct ast_str *buffer = load_service_key(val);
+			ast_string_field_set(conf, service_key, ast_str_buffer(buffer));
+			ast_free(buffer);
 		}
 
 		val = ast_variable_retrieve(cfg, "general", "endpoint");
@@ -1190,6 +1271,38 @@ static int load_config(int reload)
 			conf->enable_postendpointer_recordings = ast_true(val);
 		}
 
+		category = NULL;
+		while ((category = ast_category_browse(cfg, category))) {
+			if (strcasecmp("general", category)) {
+				const char *name = category;
+				const char *project_id = ast_variable_retrieve(cfg, category, "project_id");
+				const char *endpoint = ast_variable_retrieve(cfg, category, "endpoint");
+				const char *service_key = ast_variable_retrieve(cfg, category, "service_key");
+
+				if (!ast_strlen_zero(service_key)) {
+					struct ast_str *buffer = load_service_key(service_key);
+					if (buffer) {
+						service_key = ast_strdupa(ast_str_buffer(buffer));
+						ast_free(buffer);
+					}
+				}
+
+				if (!ast_strlen_zero(project_id)) {
+					struct gdf_logical_agent *agent;
+					
+					agent = logical_agent_alloc(name, project_id, S_OR(service_key, ""), S_OR(endpoint, ""));
+					if (agent) {
+						ao2_link(conf->logical_agents, agent);
+						ao2_ref(agent, -1);
+					} else {
+						ast_log(LOG_WARNING, "Memory allocation failed creating logical agent %s\n", name);
+					}
+				} else {
+					ast_log(LOG_WARNING, "Mapped project_id is required for %s\n", name);
+				}
+			}
+		}
+
 		/* swap out the configs */
 #ifdef ASTERISK_13_OR_LATER
 		ao2_wrlock(config);
@@ -1249,6 +1362,9 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 	default:
 		config = gdf_get_config();
 		if (config) {
+			struct ao2_iterator i;
+			struct gdf_logical_agent *agent;
+
 			ast_cli(a->fd, "[general]\n");
 			ast_cli(a->fd, "service_key = %s\n", config->service_key);
 			ast_cli(a->fd, "endpoint = %s\n", config->endpoint);
@@ -1259,6 +1375,15 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "enable_call_logs = %s\n", AST_CLI_YESNO(config->enable_call_logs));
 			ast_cli(a->fd, "enable_preendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_preendpointer_recordings));
 			ast_cli(a->fd, "enable_postendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_postendpointer_recordings));
+			i = ao2_iterator_init(config->logical_agents, 0);
+			while ((agent = ao2_iterator_next(&i))) {
+				ast_cli(a->fd, "\n[%s]\n", agent->name);
+				ast_cli(a->fd, "project_id = %s\n", agent->project_id);
+				ast_cli(a->fd, "endpoint = %s\n", agent->endpoint);
+				ast_cli(a->fd, "service_key = %s\n", agent->service_key);
+				ao2_ref(agent, -1);
+			}
+			ao2_iterator_destroy(&i);
 			ao2_ref(config, -1);
 		} else {
 			ast_cli(a->fd, "Unable to retrieve configuration\n");
