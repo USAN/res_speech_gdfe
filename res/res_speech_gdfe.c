@@ -99,8 +99,11 @@ struct gdf_pvt {
 	FILE *utterance_postendpointer_recording_file_handle;
 	
 	AST_DECLARE_STRING_FIELDS(
+		AST_STRING_FIELD(logical_agent_name);
 		AST_STRING_FIELD(project_id);
 		AST_STRING_FIELD(session_id);
+		AST_STRING_FIELD(service_key);
+		AST_STRING_FIELD(endpoint);
 		AST_STRING_FIELD(event);
 		AST_STRING_FIELD(language);
 		AST_STRING_FIELD(lastAudioResponse);
@@ -178,7 +181,9 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 
 	cfg = gdf_get_config();
 
-	pvt->session = df_create_session(cfg->endpoint, cfg->service_key, pvt);
+	pvt->session = df_create_session(pvt);
+	df_set_auth_key(pvt->session, cfg->service_key);
+	df_set_endpoint(pvt->session, cfg->endpoint);
 
 	if (!pvt->session) {
 		ast_log(LOG_WARNING, "Error creating session for GDF\n");
@@ -261,12 +266,53 @@ static int is_grammar_new_style_format(const char *grammar_name)
 	return !strncasecmp(grammar_name, BUILTIN_COLON_GRAMMAR_SLASH, BUILTIN_COLON_GRAMMAR_SLASH_LEN);
 }
 
+static void activate_agent_for_name(struct gdf_pvt *pvt, const char *name, size_t name_len, const char *event)
+{
+	struct gdf_config *config;
+
+	ast_mutex_lock(&pvt->lock);
+	ast_string_field_build(pvt, logical_agent_name, "%.*s", (int) name_len, name);
+	ast_mutex_unlock(&pvt->lock);
+
+	config = gdf_get_config();
+	if (config) {
+		struct gdf_logical_agent *logical_agent_map = get_logical_agent_by_name(config, pvt->logical_agent_name);
+		ast_mutex_lock(&pvt->lock);
+		ast_string_field_set(pvt, project_id, S_OR(logical_agent_map ? logical_agent_map->project_id : NULL, pvt->logical_agent_name));
+		ast_string_field_set(pvt, service_key, S_OR(logical_agent_map ? logical_agent_map->service_key : NULL, config->service_key));
+		ast_string_field_set(pvt, endpoint, S_OR(logical_agent_map ? logical_agent_map->endpoint : NULL, config->endpoint));
+		ast_string_field_set(pvt, event, event);
+		ast_mutex_unlock(&pvt->lock);
+		if (logical_agent_map) {
+			ao2_ref(logical_agent_map, -1);
+		}
+		ao2_ref(config, -1);
+	} else {
+		ast_mutex_lock(&pvt->lock);
+		ast_string_field_set(pvt, project_id, pvt->logical_agent_name);
+		ast_string_field_set(pvt, event, event);
+		ast_mutex_unlock(&pvt->lock);
+	}
+	df_set_project_id(pvt->session, pvt->project_id);
+	df_set_endpoint(pvt->session, pvt->endpoint);
+	df_set_auth_key(pvt->session, pvt->service_key);
+
+	if (!ast_strlen_zero(event)) {
+		ast_log(LOG_DEBUG, "Activating project %s ('%s'), event %s on %s\n", 
+			pvt->project_id, pvt->logical_agent_name, pvt->event, pvt->session_id);
+	} else {
+		ast_log(LOG_DEBUG, "Activating project %s ('%s') on %s\n", pvt->project_id, pvt->logical_agent_name,
+			pvt->session_id);
+	}
+}
+
 static void activate_new_style_grammar(struct gdf_pvt *pvt, const char *grammar_name)
 {
 	const char *name_part = grammar_name + BUILTIN_COLON_GRAMMAR_SLASH_LEN;
 	const char *event_part = "";
 	size_t name_len;
 	const char *question_mark;
+
 	if ((question_mark = strchr(name_part, '?'))) {
 		name_len = question_mark - name_part;
 		event_part = question_mark + 1;
@@ -274,18 +320,7 @@ static void activate_new_style_grammar(struct gdf_pvt *pvt, const char *grammar_
 		name_len = strlen(name_part);
 	}
 
-	ast_mutex_lock(&pvt->lock);
-	ast_string_field_build(pvt, project_id, "%.*s", (int) name_len, name_part);
-	ast_string_field_set(pvt, event, event_part);
-	ast_mutex_unlock(&pvt->lock);
-	df_set_project_id(pvt->session, pvt->project_id);
-	if (!ast_strlen_zero(event_part)) {
-		ast_log(LOG_DEBUG, "Activating project %s, event %s on %s\n", 
-			pvt->project_id, pvt->event, pvt->session_id);
-	} else {
-		ast_log(LOG_DEBUG, "Activating project %s on %s\n", pvt->project_id,
-			pvt->session_id);
-	}
+	activate_agent_for_name(pvt, name_part, name_len, event_part);
 }
 
 /** activate is used in this context to prime DFE with an event for 'detection'
@@ -769,6 +804,7 @@ static int gdf_start(struct ast_speech *speech)
 			{ "event", event },
 			{ "language", language },
 			{ "project_id", project_id },
+			{ "logical_agent_name", pvt->logical_agent_name },
 			{ "utterance", utterance_number },
 			{ "context", pvt->call_logging_context },
 			{ "application", pvt->call_logging_application_name }
