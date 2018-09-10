@@ -129,6 +129,8 @@ struct gdf_config {
 	int vad_voice_minimum_duration;
 	int vad_silence_minimum_duration;
 
+	int endpointer_cache_audio_pretrigger_ms;
+
 	int enable_call_logs;
 	int enable_preendpointer_recordings;
 	int enable_postendpointer_recordings;
@@ -1266,6 +1268,9 @@ static int load_config(int reload)
 		if (!ast_strlen_zero(val)) {
 			int i;
 			if (sscanf(val, "%d", &i) == 1) {
+				if ((i % 20) != 0) {
+					i = ((i / 20) + 1) * 20;
+				}
 				conf->vad_voice_minimum_duration = i;
 			} else {
 				ast_log(LOG_WARNING, "Invalid value for vad_voice_minimum_duration\n");
@@ -1277,9 +1282,29 @@ static int load_config(int reload)
 		if (!ast_strlen_zero(val)) {
 			int i;
 			if (sscanf(val, "%d", &i) == 1) {
+				if ((i % 20) != 0) {
+					i = ((i / 20) + 1) * 20;
+				}
 				conf->vad_silence_minimum_duration = i;
 			} else {
 				ast_log(LOG_WARNING, "Invalid value for vad_silence_minimum_duration\n");
+			}
+		}
+
+		conf->endpointer_cache_audio_pretrigger_ms = 60;
+		val = ast_variable_retrieve(cfg, "general", "endpointer_cache_audio_pretrigger_ms");
+		if (!ast_strlen_zero(val)) {
+			int i;
+			if (sscanf(val, "%d", &i) == 1) {
+				if (i % 20 != 0) {
+					int new_i = ((i / 20) + 1) * 20;
+					ast_log(LOG_WARNING, "Rounding endpointer_cache_audio_pretrigger_ms from %d to %d to match packet size\n",
+						i, new_i);
+					i = new_i;
+				}
+				conf->endpointer_cache_audio_pretrigger_ms = i;
+			} else {
+				ast_log(LOG_WARNING, "Invalid value for endpointer_cache_audio_pretrigger_ms\n");
 			}
 		}
 
@@ -1407,6 +1432,7 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "vad_voice_threshold = %d\n", config->vad_voice_threshold);
 			ast_cli(a->fd, "vad_voice_minimum_duration = %d\n", config->vad_voice_minimum_duration);
 			ast_cli(a->fd, "vad_silence_minimum_duration = %d\n", config->vad_silence_minimum_duration);
+			ast_cli(a->fd, "endpointer_cache_audio_pretrigger_ms = %d\n", config->endpointer_cache_audio_pretrigger_ms);
 			ast_cli(a->fd, "call_log_location = %s\n", config->call_log_location);
 			ast_cli(a->fd, "enable_call_logs = %s\n", AST_CLI_YESNO(config->enable_call_logs));
 			ast_cli(a->fd, "enable_preendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_preendpointer_recordings));
