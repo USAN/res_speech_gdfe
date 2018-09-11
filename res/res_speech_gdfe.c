@@ -97,6 +97,10 @@ struct gdf_pvt {
 	FILE *utterance_preendpointer_recording_file_handle;
 	int utterance_postendpointer_recording_open_already_attempted;
 	FILE *utterance_postendpointer_recording_file_handle;
+
+	char *mulaw_endpointer_audio_cache;
+	size_t mulaw_endpointer_audio_cache_size;
+	size_t mulaw_endpointer_audio_cache_pos;
 	
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(logical_agent_name);
@@ -202,6 +206,15 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	pvt->silence_minimum_duration = cfg->vad_silence_minimum_duration;
 	ast_string_field_set(pvt, call_logging_application_name, "unknown");
 
+	if (pvt->voice_minimum_duration || cfg->endpointer_cache_audio_pretrigger_ms) {
+		size_t cache_needed_size = (pvt->voice_minimum_duration + cfg->endpointer_cache_audio_pretrigger_ms) * 8; /* bytes per millisecond */
+		pvt->mulaw_endpointer_audio_cache = ast_calloc(1, cache_needed_size);
+		if (pvt->mulaw_endpointer_audio_cache) {
+			pvt->mulaw_endpointer_audio_cache_size = cache_needed_size;
+			pvt->mulaw_endpointer_audio_cache_pos = 0;
+		}
+	}
+
 	ast_mutex_lock(&speech->lock);
 	speech->state = AST_SPEECH_STATE_NOT_READY;
 	speech->data = pvt;
@@ -230,8 +243,13 @@ static int gdf_destroy(struct ast_speech *speech)
 		fclose(pvt->call_log_file_handle);
 	}
 
+	if (pvt->mulaw_endpointer_audio_cache) {
+		ast_free(pvt->mulaw_endpointer_audio_cache);
+	}
+
 	ast_string_field_free_memory(pvt);
 	ast_mutex_destroy(&pvt->lock);
+	ast_free(pvt);
 	return 0;
 }
 
@@ -884,6 +902,9 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 			return -1;
 		} else if (sscanf(value, "%d", &i) == 1) {
 			ast_mutex_lock(&pvt->lock);
+			if ((i % 20) != 0) {
+				i = ((i / 20) + 1) * 20;
+			}
 			pvt->voice_minimum_duration = i;
 			ast_mutex_unlock(&pvt->lock);
 		} else {
