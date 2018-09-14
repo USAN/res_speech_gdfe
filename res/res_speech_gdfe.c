@@ -648,7 +648,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 
 	cur_duration += datams;
 
-	avg_level = calculate_audio_level((short *)data, len);
+	avg_level = calculate_audio_level((short *)data, datasamples);
 	if (avg_level >= threshold) {
 		if (vad_state != VAD_STATE_SPEAK) {
 			change_duration += datams;
