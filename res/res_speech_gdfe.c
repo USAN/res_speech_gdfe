@@ -1358,7 +1358,7 @@ static int load_config(int reload)
 			ast_string_field_set(conf, endpoint, val);
 		}
 
-		conf->vad_voice_threshold = 512;
+		conf->vad_voice_threshold = 1024;
 		val = ast_variable_retrieve(cfg, "general", "vad_voice_threshold");
 		if (!ast_strlen_zero(val)) {
 			int i;
@@ -1369,7 +1369,7 @@ static int load_config(int reload)
 			}
 		}
 
-		conf->vad_voice_minimum_duration = 40; /* ms */
+		conf->vad_voice_minimum_duration = 100; /* ms */
 		val = ast_variable_retrieve(cfg, "general", "vad_voice_minimum_duration");
 		if (!ast_strlen_zero(val)) {
 			int i;
@@ -1397,7 +1397,7 @@ static int load_config(int reload)
 			}
 		}
 
-		conf->endpointer_cache_audio_pretrigger_ms = 60;
+		conf->endpointer_cache_audio_pretrigger_ms = 100;
 		val = ast_variable_retrieve(cfg, "general", "endpointer_cache_audio_pretrigger_ms");
 		if (!ast_strlen_zero(val)) {
 			int i;
