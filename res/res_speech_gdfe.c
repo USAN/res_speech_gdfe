@@ -804,7 +804,7 @@ static void calculate_log_file_basename(struct gdf_pvt *pvt)
 
 static void mkdir_log_path(struct gdf_pvt *pvt)
 {
-	ast_mkdir(pvt->call_log_path, 0644);
+	ast_mkdir(pvt->call_log_path, 0755);
 }
 
 static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf_pvt *pvt, int include_utterance_counter, const char *type, const char *extension)
