@@ -35,6 +35,12 @@
 #endif
 
 #ifdef ASTERISK_13_OR_LATER
+#ifndef AST_SPEECH_HAVE_GET_SETTING
+#define AST_SPEECH_HAVE_GET_SETTING
+#endif
+#endif
+
+#ifdef ASTERISK_13_OR_LATER
 #include <asterisk/format.h>
 #include <asterisk/format_cache.h>
 #include <asterisk/codec.h>
@@ -69,6 +75,8 @@
 #define VAD_PROP_VOICE_THRESHOLD	"voice_threshold"
 #define VAD_PROP_VOICE_DURATION		"voice_duration"
 #define VAD_PROP_SILENCE_DURATION	"silence_duration"
+
+#define GDF_PROP_UTTERANCE_DURATION_MS	"utterance_duration_ms"
 
 enum VAD_STATE {
 	VAD_STATE_START,
@@ -765,11 +773,11 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 			ast_mutex_unlock(&pvt->lock);
 		}
 		if (state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
-		state = df_write_audio(pvt->session, mulaw, mulaw_len);
+			state = df_write_audio(pvt->session, mulaw, mulaw_len);
 
-		ast_mutex_lock(&pvt->lock);
-		pvt->last_audio_duration_ms += mulaw_len / 8;
-		ast_mutex_unlock(&pvt->lock);
+			ast_mutex_lock(&pvt->lock);
+			pvt->last_audio_duration_ms += mulaw_len / 8;
+			ast_mutex_unlock(&pvt->lock);
 		}
 
 		if (!ast_test_flag(speech, AST_SPEECH_SPOKE) && df_get_response_count(pvt->session) > 0) {
@@ -1069,12 +1077,18 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 	return 0;
 }
 
-#ifdef ASTERISK_13_OR_LATER
+#ifdef AST_SPEECH_HAVE_GET_SETTING
 static int gdf_get_setting(struct ast_speech *speech, const char *name, char *buf, size_t len)
 {
 	struct gdf_pvt *pvt = speech->data;
 
-	if (!strcasecmp(name, GDF_PROP_SESSION_ID_NAME)) {
+	if (!strcasecmp(name, GDF_PROP_UTTERANCE_DURATION_MS)) {
+		long long last_audio_duration_ms;
+		ast_mutex_lock(&pvt->lock);
+		last_audio_duration_ms = pvt->last_audio_duration_ms;
+		ast_mutex_unlock(&pvt->lock);
+		ast_build_string(&buf, &len, "%lld", last_audio_duration_ms);
+	} else if (!strcasecmp(name, GDF_PROP_SESSION_ID_NAME)) {
 		ast_copy_string(buf, df_get_session_id(pvt->session), len);
 	} else if (!strcasecmp(name, GDF_PROP_PROJECT_ID_NAME)) {
 		ast_copy_string(buf, df_get_project_id(pvt->session), len);
@@ -1746,7 +1760,7 @@ static struct ast_speech_engine gdf_engine = {
 	.dtmf = gdf_dtmf,
 	.start = gdf_start,
 	.change = gdf_change,
-#ifdef ASTERISK_13_OR_LATER
+#ifdef AST_SPEECH_HAVE_GET_SETTING
 	.get_setting = gdf_get_setting,
 #endif
 	.change_results_type = gdf_change_results_type,
