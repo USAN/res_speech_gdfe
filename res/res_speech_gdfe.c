@@ -419,15 +419,6 @@ static void write_end_of_recognition_call_event(struct gdf_pvt *pvt)
 	gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "stop", ARRAY_LEN(log_data), log_data);
 }
 
-static int are_currently_recording_pre_endpointed_audio(struct gdf_pvt *pvt)
-{
-	int are_recording;
-	ast_mutex_lock(&pvt->lock);
-	are_recording = (pvt->utterance_preendpointer_recording_file_handle != NULL);
-	ast_mutex_unlock(&pvt->lock);
-	return are_recording;
-}
-
 static int open_preendpointed_recording_file(struct gdf_pvt *pvt)
 {
 	struct ast_str *path = build_log_related_filename_to_thread_local_str(pvt, 1, "pre", "ul");
@@ -492,6 +483,7 @@ static void coalesce_cached_audio_for_writing(struct gdf_pvt *pvt)
 			end_amount_at_beginning_of_buffer = (pvt->mulaw_endpointer_audio_cache_start + pvt->mulaw_endpointer_audio_cache_len) - pvt->mulaw_endpointer_audio_cache_size;
 		} else {
 			ast_log(LOG_DEBUG, "Audio cache buffer for %s not a full buffer but starts in middle\n", pvt->session_id);
+			end_amount_at_beginning_of_buffer = 0;
 		}
 
 		if (end_amount_at_beginning_of_buffer == 0) {
@@ -665,11 +657,16 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	int avg_level;
 	int voice_duration;
 	int silence_duration;
-	const int datasamples = len / sizeof(short); /* 2 bytes per sample for slin */;
-	const int datams = datasamples / 8; /* 8 samples per millisecond */;
-	const int mulaw_len = datasamples * sizeof(char);
-	char *mulaw = alloca(mulaw_len);
+	int datasamples;
+	int datams;
+	int mulaw_len;
+	char *mulaw;
 	int i;
+
+	datasamples = len / sizeof(short); /* 2 bytes per sample for slin */;
+	datams = datasamples / 8; /* 8 samples per millisecond */;
+	mulaw_len = datasamples * sizeof(char);
+	mulaw = alloca(mulaw_len);
 
 	ast_mutex_lock(&pvt->lock);
 	orig_vad_state = vad_state = pvt->vad_state;
@@ -746,6 +743,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	maybe_cache_preendpointed_audio(pvt, mulaw, mulaw_len, vad_state);
 
 	if (vad_state != VAD_STATE_START) {
+		state = df_get_state(pvt->session);
 		if (orig_vad_state == VAD_STATE_START) {
 			size_t flush_start = 0;
 
@@ -766,11 +764,13 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 			pvt->last_audio_duration_ms += flush_start / 8;
 			ast_mutex_unlock(&pvt->lock);
 		}
+		if (state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
 		state = df_write_audio(pvt->session, mulaw, mulaw_len);
 
 		ast_mutex_lock(&pvt->lock);
 		pvt->last_audio_duration_ms += mulaw_len / 8;
 		ast_mutex_unlock(&pvt->lock);
+		}
 
 		if (!ast_test_flag(speech, AST_SPEECH_SPOKE) && df_get_response_count(pvt->session) > 0) {
 			ast_set_flag(speech, AST_SPEECH_QUIET);
@@ -857,8 +857,8 @@ static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf
 	struct ast_str *path;
 	path = ast_str_thread_get(&call_log_path, 256);
 	ast_mutex_lock(&pvt->lock);
-	ast_str_set(&path, 0, pvt->call_log_path);
-	ast_str_append(&path, 0, pvt->call_log_file_basename);
+	ast_str_set(&path, 0, "%s", pvt->call_log_path);
+	ast_str_append(&path, 0, "%s", pvt->call_log_file_basename);
 	ast_str_append(&path, 0, "_%s", type);
 	if (include_utterance_counter) {
 		ast_str_append(&path, 0, "_%d", pvt->utterance_counter);
@@ -1329,7 +1329,7 @@ static struct ast_str *load_service_key(const char *val)
 	}
 
 	if (strchr(val, '{')) {
-		ast_str_set(&buffer, 0, val);
+		ast_str_set(&buffer, 0, "%s", val);
 	} else {
 		FILE *f;
 		ast_log(LOG_DEBUG, "Loading service key data from %s\n", val);
@@ -1707,12 +1707,18 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 #endif
 }
 
-static void libdialogflow_general_logging_callback(enum dialogflow_log_level level, const char *file, int line, const char *function, const char *fmt, va_list args)
+static void libdialogflow_general_logging_callback(enum dialogflow_log_level level, 
+	const char *file, int line, const char *function, const char *fmt, va_list args)
+	__attribute__ ((format(printf, 5, 0)));
+
+static void libdialogflow_general_logging_callback(enum dialogflow_log_level level, 
+	const char *file, int line, const char *function, const char *fmt, va_list args)
 {
+	size_t len;
 	char *buff;
 	va_list args2;
 	va_copy(args2, args);
-    size_t len = vsnprintf(NULL, 0, fmt, args2);
+    len = vsnprintf(NULL, 0, fmt, args2);
     va_end(args2);
     buff = alloca(len + 1);
     vsnprintf(buff, len + 1, fmt, args);
@@ -1747,6 +1753,7 @@ static struct ast_speech_engine gdf_engine = {
 	.get = gdf_get_results
 };
 
+#pragma GCC diagnostic ignored "-Wmissing-format-attribute"
 static enum ast_module_load_result load_module(void)
 {
 	struct gdf_config *cfg;
