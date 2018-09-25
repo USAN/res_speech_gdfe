@@ -97,6 +97,11 @@ struct gdf_pvt {
 	FILE *utterance_preendpointer_recording_file_handle;
 	int utterance_postendpointer_recording_open_already_attempted;
 	FILE *utterance_postendpointer_recording_file_handle;
+
+	char *mulaw_endpointer_audio_cache;
+	size_t mulaw_endpointer_audio_cache_size;
+	size_t mulaw_endpointer_audio_cache_start;
+	size_t mulaw_endpointer_audio_cache_len;
 	
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(logical_agent_name);
@@ -128,6 +133,8 @@ struct gdf_config {
 	int vad_voice_threshold;
 	int vad_voice_minimum_duration;
 	int vad_silence_minimum_duration;
+
+	int endpointer_cache_audio_pretrigger_ms;
 
 	int enable_call_logs;
 	int enable_preendpointer_recordings;
@@ -200,6 +207,16 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	pvt->silence_minimum_duration = cfg->vad_silence_minimum_duration;
 	ast_string_field_set(pvt, call_logging_application_name, "unknown");
 
+	if (pvt->voice_minimum_duration || cfg->endpointer_cache_audio_pretrigger_ms) {
+		size_t cache_needed_size = (pvt->voice_minimum_duration + cfg->endpointer_cache_audio_pretrigger_ms) * 8; /* bytes per millisecond */
+		pvt->mulaw_endpointer_audio_cache = ast_calloc(1, cache_needed_size);
+		if (pvt->mulaw_endpointer_audio_cache) {
+			pvt->mulaw_endpointer_audio_cache_size = cache_needed_size;
+			pvt->mulaw_endpointer_audio_cache_start = 0;
+			pvt->mulaw_endpointer_audio_cache_len = 0;
+		}
+	}
+
 	ast_mutex_lock(&speech->lock);
 	speech->state = AST_SPEECH_STATE_NOT_READY;
 	speech->data = pvt;
@@ -228,8 +245,13 @@ static int gdf_destroy(struct ast_speech *speech)
 		fclose(pvt->call_log_file_handle);
 	}
 
+	if (pvt->mulaw_endpointer_audio_cache) {
+		ast_free(pvt->mulaw_endpointer_audio_cache);
+	}
+
 	ast_string_field_free_memory(pvt);
 	ast_mutex_destroy(&pvt->lock);
+	ast_free(pvt);
 	return 0;
 }
 
@@ -425,6 +447,44 @@ static int open_postendpointed_recording_file(struct gdf_pvt *pvt)
 	return (record_file == NULL ? -1 : 0);
 }
 
+static void coalesce_cached_audio_for_writing(struct gdf_pvt *pvt)
+{
+	ast_mutex_lock(&pvt->lock);
+	if (pvt->mulaw_endpointer_audio_cache) {
+		size_t end_amount_at_beginning_of_buffer;
+		
+		if (pvt->mulaw_endpointer_audio_cache_start == 0) {
+			end_amount_at_beginning_of_buffer = 0;
+		} else if (pvt->mulaw_endpointer_audio_cache_start + pvt->mulaw_endpointer_audio_cache_len > pvt->mulaw_endpointer_audio_cache_size) {
+			end_amount_at_beginning_of_buffer = (pvt->mulaw_endpointer_audio_cache_start + pvt->mulaw_endpointer_audio_cache_len) - pvt->mulaw_endpointer_audio_cache_size;
+		} else {
+			ast_log(LOG_DEBUG, "Audio cache buffer for %s not a full buffer but starts in middle\n", pvt->session_id);
+		}
+
+		if (end_amount_at_beginning_of_buffer == 0) {
+			if (pvt->mulaw_endpointer_audio_cache_start == 0) {
+				/* nothing to do */
+			} else {
+				char *start_of_cached_audio = pvt->mulaw_endpointer_audio_cache + pvt->mulaw_endpointer_audio_cache_start;
+				memmove(pvt->mulaw_endpointer_audio_cache, start_of_cached_audio, pvt->mulaw_endpointer_audio_cache_len);
+				pvt->mulaw_endpointer_audio_cache_start = 0;
+			}
+		} else {
+			char *cache = alloca(end_amount_at_beginning_of_buffer);
+			char *start_of_cached_audio = pvt->mulaw_endpointer_audio_cache + pvt->mulaw_endpointer_audio_cache_start;
+			size_t amount_of_audio_at_end_of_buffer = pvt->mulaw_endpointer_audio_cache_size - pvt->mulaw_endpointer_audio_cache_start;
+			char *where_end_of_audio_will_go = pvt->mulaw_endpointer_audio_cache + amount_of_audio_at_end_of_buffer;
+
+			memcpy(cache, pvt->mulaw_endpointer_audio_cache, end_amount_at_beginning_of_buffer);
+			memmove(pvt->mulaw_endpointer_audio_cache, start_of_cached_audio, amount_of_audio_at_end_of_buffer);
+			memcpy(where_end_of_audio_will_go, cache, end_amount_at_beginning_of_buffer);
+
+			pvt->mulaw_endpointer_audio_cache_start = 0;
+		}
+	}
+	ast_mutex_unlock(&pvt->lock);
+}
+
 static void maybe_record_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mulaw_len, enum VAD_STATE current_vad_state)
 {
 	struct gdf_config *config = gdf_get_config();
@@ -470,9 +530,20 @@ static void maybe_record_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mu
 	}
 
 	if (enable_postendpointer_recordings && current_vad_state == VAD_STATE_SPEAK) {
+		int need_to_dump_cached_audio = 0;
 		if (!currently_recording_postendpointed_audio && !already_attempted_open_for_postendpointed_audio) {
 			if (!open_postendpointed_recording_file(pvt)) {
 				currently_recording_postendpointed_audio = 1;
+				need_to_dump_cached_audio = 1;
+			}
+		}
+		if (need_to_dump_cached_audio) {
+			size_t written;
+			coalesce_cached_audio_for_writing(pvt);
+			written = fwrite(pvt->mulaw_endpointer_audio_cache, sizeof(char), pvt->mulaw_endpointer_audio_cache_len, pvt->utterance_postendpointer_recording_file_handle);
+			if (written < pvt->mulaw_endpointer_audio_cache_len) {
+				ast_log(LOG_WARNING, "Only wrote %d of %d bytes for cached post-endpointed recording for %s\n",
+					(int) written, (int) pvt->mulaw_endpointer_audio_cache_len, pvt->session_id);
 			}
 		}
 		if (currently_recording_postendpointed_audio) {
@@ -482,6 +553,37 @@ static void maybe_record_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mu
 					(int) written, (int) mulaw_len, pvt->session_id);
 			}
 		}
+	}
+}
+
+static void maybe_cache_preendpointed_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mulaw_len, enum VAD_STATE vad_state)
+{
+	if (vad_state == VAD_STATE_START) {
+		ast_mutex_lock(&pvt->lock);
+		if (pvt->mulaw_endpointer_audio_cache) {
+			size_t relative_write_location;
+			char *write_location;
+
+			if (pvt->mulaw_endpointer_audio_cache_len + mulaw_len > pvt->mulaw_endpointer_audio_cache_size) {
+				size_t space_needed = pvt->mulaw_endpointer_audio_cache_len + mulaw_len - pvt->mulaw_endpointer_audio_cache_size;
+				pvt->mulaw_endpointer_audio_cache_start += space_needed;
+				pvt->mulaw_endpointer_audio_cache_len -= space_needed;
+				if (pvt->mulaw_endpointer_audio_cache_start >= pvt->mulaw_endpointer_audio_cache_size) {
+					pvt->mulaw_endpointer_audio_cache_start -= pvt->mulaw_endpointer_audio_cache_size;
+				}
+			}
+
+			relative_write_location = pvt->mulaw_endpointer_audio_cache_start + pvt->mulaw_endpointer_audio_cache_len;
+			if (relative_write_location >= pvt->mulaw_endpointer_audio_cache_size) {
+				relative_write_location -= pvt->mulaw_endpointer_audio_cache_size;
+			}
+			
+			write_location = pvt->mulaw_endpointer_audio_cache + relative_write_location;
+
+			memcpy(write_location, mulaw, mulaw_len);
+			pvt->mulaw_endpointer_audio_cache_len += mulaw_len;
+		}
+		ast_mutex_unlock(&pvt->lock);
 	}
 }
 
@@ -529,8 +631,11 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	int avg_level;
 	int voice_duration;
 	int silence_duration;
-	int datams;
-	int datasamples;
+	const int datasamples = len / sizeof(short); /* 2 bytes per sample for slin */;
+	const int datams = datasamples / 8; /* 8 samples per millisecond */;
+	const int mulaw_len = datasamples * sizeof(char);
+	char *mulaw = alloca(mulaw_len);
+	int i;
 
 	ast_mutex_lock(&pvt->lock);
 	orig_vad_state = vad_state = pvt->vad_state;
@@ -541,12 +646,9 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	silence_duration = pvt->silence_minimum_duration;
 	ast_mutex_unlock(&pvt->lock);
 
-	datasamples = len / sizeof(short); /* 2 bytes per sample for slin */
-	datams = datasamples / 8; /* 8 samples per millisecond */
-
 	cur_duration += datams;
 
-	avg_level = calculate_audio_level((short *)data, len);
+	avg_level = calculate_audio_level((short *)data, datasamples);
 	if (avg_level >= threshold) {
 		if (vad_state != VAD_STATE_SPEAK) {
 			change_duration += datams;
@@ -599,17 +701,30 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 		}
 	}
 
+	for (i = 0; i < datasamples; i++) {
+		mulaw[i] = AST_LIN2MU(((short *)data)[i]);
+	}
+	
+	maybe_record_audio(pvt, mulaw, mulaw_len, vad_state);
+	maybe_cache_preendpointed_audio(pvt, mulaw, mulaw_len, vad_state);
+
 	if (vad_state != VAD_STATE_START) {
-		int mulaw_len = datasamples * sizeof(char);
-		char *mulaw = alloca(mulaw_len);
-		int i;
+		if (orig_vad_state == VAD_STATE_START) {
+			size_t flush_start = 0;
 
-		for (i = 0; i < datasamples; i++) {
-			mulaw[i] = AST_LIN2MU(((short *)data)[i]);
+			coalesce_cached_audio_for_writing(pvt);
+
+			while (flush_start < pvt->mulaw_endpointer_audio_cache_len && state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
+				if (flush_start + mulaw_len <= pvt->mulaw_endpointer_audio_cache_len) {
+					state = df_write_audio(pvt->session, pvt->mulaw_endpointer_audio_cache + flush_start, mulaw_len);
+					flush_start += mulaw_len;
+				} else {
+					size_t partial_write_size = pvt->mulaw_endpointer_audio_cache_len - flush_start;
+					state = df_write_audio(pvt->session, pvt->mulaw_endpointer_audio_cache + flush_start, partial_write_size);
+					flush_start += partial_write_size;
+				}
+			}
 		}
-
-		maybe_record_audio(pvt, mulaw, mulaw_len, vad_state);
-
 		state = df_write_audio(pvt->session, mulaw, mulaw_len);
 
 		if (!ast_test_flag(speech, AST_SPEECH_SPOKE) && df_get_response_count(pvt->session) > 0) {
@@ -621,16 +736,6 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 			df_stop_recognition(pvt->session);
 			gdf_stop_recognition(speech, pvt);
 		}
-	} else if (are_currently_recording_pre_endpointed_audio(pvt)) {
-		int mulaw_len = datasamples * sizeof(char);
-		char *mulaw = alloca(mulaw_len);
-		int i;
-
-		for (i = 0; i < datasamples; i++) {
-			mulaw[i] = AST_LIN2MU(((short *)data)[i]);
-		}
-
-		maybe_record_audio(pvt, mulaw, mulaw_len, vad_state);
 	}
 
 	return 0;
@@ -699,7 +804,7 @@ static void calculate_log_file_basename(struct gdf_pvt *pvt)
 
 static void mkdir_log_path(struct gdf_pvt *pvt)
 {
-	ast_mkdir(pvt->call_log_path, 0644);
+	ast_mkdir(pvt->call_log_path, 0755);
 }
 
 static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf_pvt *pvt, int include_utterance_counter, const char *type, const char *extension)
@@ -882,6 +987,9 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 			return -1;
 		} else if (sscanf(value, "%d", &i) == 1) {
 			ast_mutex_lock(&pvt->lock);
+			if ((i % 20) != 0) {
+				i = ((i / 20) + 1) * 20;
+			}
 			pvt->voice_minimum_duration = i;
 			ast_mutex_unlock(&pvt->lock);
 		} else {
@@ -1250,7 +1358,7 @@ static int load_config(int reload)
 			ast_string_field_set(conf, endpoint, val);
 		}
 
-		conf->vad_voice_threshold = 512;
+		conf->vad_voice_threshold = 1024;
 		val = ast_variable_retrieve(cfg, "general", "vad_voice_threshold");
 		if (!ast_strlen_zero(val)) {
 			int i;
@@ -1261,11 +1369,14 @@ static int load_config(int reload)
 			}
 		}
 
-		conf->vad_voice_minimum_duration = 40; /* ms */
+		conf->vad_voice_minimum_duration = 100; /* ms */
 		val = ast_variable_retrieve(cfg, "general", "vad_voice_minimum_duration");
 		if (!ast_strlen_zero(val)) {
 			int i;
 			if (sscanf(val, "%d", &i) == 1) {
+				if ((i % 20) != 0) {
+					i = ((i / 20) + 1) * 20;
+				}
 				conf->vad_voice_minimum_duration = i;
 			} else {
 				ast_log(LOG_WARNING, "Invalid value for vad_voice_minimum_duration\n");
@@ -1277,9 +1388,29 @@ static int load_config(int reload)
 		if (!ast_strlen_zero(val)) {
 			int i;
 			if (sscanf(val, "%d", &i) == 1) {
+				if ((i % 20) != 0) {
+					i = ((i / 20) + 1) * 20;
+				}
 				conf->vad_silence_minimum_duration = i;
 			} else {
 				ast_log(LOG_WARNING, "Invalid value for vad_silence_minimum_duration\n");
+			}
+		}
+
+		conf->endpointer_cache_audio_pretrigger_ms = 100;
+		val = ast_variable_retrieve(cfg, "general", "endpointer_cache_audio_pretrigger_ms");
+		if (!ast_strlen_zero(val)) {
+			int i;
+			if (sscanf(val, "%d", &i) == 1) {
+				if (i % 20 != 0) {
+					int new_i = ((i / 20) + 1) * 20;
+					ast_log(LOG_WARNING, "Rounding endpointer_cache_audio_pretrigger_ms from %d to %d to match packet size\n",
+						i, new_i);
+					i = new_i;
+				}
+				conf->endpointer_cache_audio_pretrigger_ms = i;
+			} else {
+				ast_log(LOG_WARNING, "Invalid value for endpointer_cache_audio_pretrigger_ms\n");
 			}
 		}
 
@@ -1407,6 +1538,7 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "vad_voice_threshold = %d\n", config->vad_voice_threshold);
 			ast_cli(a->fd, "vad_voice_minimum_duration = %d\n", config->vad_voice_minimum_duration);
 			ast_cli(a->fd, "vad_silence_minimum_duration = %d\n", config->vad_silence_minimum_duration);
+			ast_cli(a->fd, "endpointer_cache_audio_pretrigger_ms = %d\n", config->endpointer_cache_audio_pretrigger_ms);
 			ast_cli(a->fd, "call_log_location = %s\n", config->call_log_location);
 			ast_cli(a->fd, "enable_call_logs = %s\n", AST_CLI_YESNO(config->enable_call_logs));
 			ast_cli(a->fd, "enable_preendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_preendpointer_recordings));
