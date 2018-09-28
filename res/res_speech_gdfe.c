@@ -35,6 +35,12 @@
 #endif
 
 #ifdef ASTERISK_13_OR_LATER
+#ifndef AST_SPEECH_HAVE_GET_SETTING
+#define AST_SPEECH_HAVE_GET_SETTING
+#endif
+#endif
+
+#ifdef ASTERISK_13_OR_LATER
 #include <asterisk/format.h>
 #include <asterisk/format_cache.h>
 #include <asterisk/codec.h>
@@ -70,6 +76,8 @@
 #define VAD_PROP_VOICE_DURATION		"voice_duration"
 #define VAD_PROP_SILENCE_DURATION	"silence_duration"
 
+#define GDF_PROP_UTTERANCE_DURATION_MS	"utterance_duration_ms"
+
 enum VAD_STATE {
 	VAD_STATE_START,
 	VAD_STATE_SPEAK,
@@ -102,6 +110,11 @@ struct gdf_pvt {
 	size_t mulaw_endpointer_audio_cache_size;
 	size_t mulaw_endpointer_audio_cache_start;
 	size_t mulaw_endpointer_audio_cache_len;
+
+	struct timeval session_start; /* log only, no store duration */
+	struct timeval request_start;
+	long long last_request_duration_ms;
+	long long last_audio_duration_ms; /* calculated by packet, not clock */
 	
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(logical_agent_name);
@@ -151,6 +164,7 @@ struct gdf_config {
 
 enum gdf_call_log_type {
 	CALL_LOG_TYPE_SESSION,
+	CALL_LOG_TYPE_RECOGNITION,
 	CALL_LOG_TYPE_ENDPOINTER,
 	CALL_LOG_TYPE_DIALOGFLOW
 };
@@ -205,6 +219,7 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	pvt->voice_threshold = cfg->vad_voice_threshold;
 	pvt->voice_minimum_duration = cfg->vad_voice_minimum_duration;
 	pvt->silence_minimum_duration = cfg->vad_silence_minimum_duration;
+	pvt->session_start = ast_tvnow();
 	ast_string_field_set(pvt, call_logging_application_name, "unknown");
 
 	if (pvt->voice_minimum_duration || cfg->endpointer_cache_audio_pretrigger_ms) {
@@ -227,6 +242,20 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	return 0;
 }
 
+static void log_session_end(struct gdf_pvt *pvt, long long duration_ms)
+{
+	char duration_buffer[20] = "";
+	char *buff = duration_buffer;
+	size_t buffLen = sizeof(duration_buffer);
+	struct dialogflow_log_data log_data[] = {
+		{ "duration_ms", duration_buffer }
+	};
+
+	ast_build_string(&buff, &buffLen, "%lld", duration_ms);
+
+	gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "end", ARRAY_LEN(log_data), log_data);
+}
+
 static int gdf_destroy(struct ast_speech *speech)
 {
 	struct gdf_pvt *pvt = speech->data;
@@ -240,6 +269,8 @@ static int gdf_destroy(struct ast_speech *speech)
 	}
 
 	df_close_session(pvt->session);
+	
+	log_session_end(pvt, ast_tvdiff_ms(ast_tvnow(), pvt->session_start));
 
 	if (pvt->call_log_file_handle != NULL) {
 		fclose(pvt->call_log_file_handle);
@@ -383,16 +414,17 @@ static int calculate_audio_level(const short *slin, int len)
 
 static void write_end_of_recognition_call_event(struct gdf_pvt *pvt)
 {
-	gdf_log_call_event_only(pvt, CALL_LOG_TYPE_SESSION, "end");
-}
+	char duration_buffer[21] = "";
+	char utterance_duration_buffer[21] = "";
+	struct dialogflow_log_data log_data[] = {
+		{ "duration_ms", duration_buffer },
+		{ "utterance_duration_ms", utterance_duration_buffer }
+	};
 
-static int are_currently_recording_pre_endpointed_audio(struct gdf_pvt *pvt)
-{
-	int are_recording;
-	ast_mutex_lock(&pvt->lock);
-	are_recording = (pvt->utterance_preendpointer_recording_file_handle != NULL);
-	ast_mutex_unlock(&pvt->lock);
-	return are_recording;
+	sprintf(duration_buffer, "%lld", pvt->last_request_duration_ms);
+	sprintf(utterance_duration_buffer, "%lld", pvt->last_audio_duration_ms);
+
+	gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "stop", ARRAY_LEN(log_data), log_data);
 }
 
 static int open_preendpointed_recording_file(struct gdf_pvt *pvt)
@@ -459,6 +491,7 @@ static void coalesce_cached_audio_for_writing(struct gdf_pvt *pvt)
 			end_amount_at_beginning_of_buffer = (pvt->mulaw_endpointer_audio_cache_start + pvt->mulaw_endpointer_audio_cache_len) - pvt->mulaw_endpointer_audio_cache_size;
 		} else {
 			ast_log(LOG_DEBUG, "Audio cache buffer for %s not a full buffer but starts in middle\n", pvt->session_id);
+			end_amount_at_beginning_of_buffer = 0;
 		}
 
 		if (end_amount_at_beginning_of_buffer == 0) {
@@ -614,6 +647,7 @@ static int gdf_stop_recognition(struct ast_speech *speech, struct gdf_pvt *pvt)
 	close_preendpointed_audio_recording(pvt);
 	close_postendpointed_audio_recording(pvt);
 	ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
+	pvt->last_request_duration_ms = ast_tvdiff_ms(ast_tvnow(), pvt->request_start);
 	write_end_of_recognition_call_event(pvt);
 	return 0;
 }
@@ -631,11 +665,16 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	int avg_level;
 	int voice_duration;
 	int silence_duration;
-	const int datasamples = len / sizeof(short); /* 2 bytes per sample for slin */;
-	const int datams = datasamples / 8; /* 8 samples per millisecond */;
-	const int mulaw_len = datasamples * sizeof(char);
-	char *mulaw = alloca(mulaw_len);
+	int datasamples;
+	int datams;
+	int mulaw_len;
+	char *mulaw;
 	int i;
+
+	datasamples = len / sizeof(short); /* 2 bytes per sample for slin */;
+	datams = datasamples / 8; /* 8 samples per millisecond */;
+	mulaw_len = datasamples * sizeof(char);
+	mulaw = alloca(mulaw_len);
 
 	ast_mutex_lock(&pvt->lock);
 	orig_vad_state = vad_state = pvt->vad_state;
@@ -699,6 +738,9 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 			ast_log(LOG_WARNING, "Error starting recognition on %s\n", pvt->session_id);
 			gdf_stop_recognition(speech, pvt);
 		}
+		ast_mutex_lock(&pvt->lock);
+		pvt->last_audio_duration_ms = 0;
+		ast_mutex_unlock(&pvt->lock);
 	}
 
 	for (i = 0; i < datasamples; i++) {
@@ -709,6 +751,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	maybe_cache_preendpointed_audio(pvt, mulaw, mulaw_len, vad_state);
 
 	if (vad_state != VAD_STATE_START) {
+		state = df_get_state(pvt->session);
 		if (orig_vad_state == VAD_STATE_START) {
 			size_t flush_start = 0;
 
@@ -724,8 +767,18 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 					flush_start += partial_write_size;
 				}
 			}
+
+			ast_mutex_lock(&pvt->lock);
+			pvt->last_audio_duration_ms += flush_start / 8;
+			ast_mutex_unlock(&pvt->lock);
 		}
-		state = df_write_audio(pvt->session, mulaw, mulaw_len);
+		if (state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
+			state = df_write_audio(pvt->session, mulaw, mulaw_len);
+
+			ast_mutex_lock(&pvt->lock);
+			pvt->last_audio_duration_ms += mulaw_len / 8;
+			ast_mutex_unlock(&pvt->lock);
+		}
 
 		if (!ast_test_flag(speech, AST_SPEECH_SPOKE) && df_get_response_count(pvt->session) > 0) {
 			ast_set_flag(speech, AST_SPEECH_QUIET);
@@ -812,8 +865,8 @@ static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf
 	struct ast_str *path;
 	path = ast_str_thread_get(&call_log_path, 256);
 	ast_mutex_lock(&pvt->lock);
-	ast_str_set(&path, 0, pvt->call_log_path);
-	ast_str_append(&path, 0, pvt->call_log_file_basename);
+	ast_str_set(&path, 0, "%s", pvt->call_log_path);
+	ast_str_append(&path, 0, "%s", pvt->call_log_file_basename);
 	ast_str_append(&path, 0, "_%s", type);
 	if (include_utterance_counter) {
 		ast_str_append(&path, 0, "_%d", pvt->utterance_counter);
@@ -842,10 +895,16 @@ static void start_call_log(struct gdf_pvt *pvt)
 
 		log_file = fopen(ast_str_buffer(path), "w");
 		if (log_file) {
+			struct dialogflow_log_data log_data[] = {
+				{ "application", pvt->call_logging_application_name }
+			};
+
 			ast_log(LOG_DEBUG, "Opened %s for call log for %s\n", ast_str_buffer(path), pvt->session_id);
 			ast_mutex_lock(&pvt->lock);
 			pvt->call_log_file_handle = log_file;
 			ast_mutex_unlock(&pvt->lock);
+
+			gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "start", ARRAY_LEN(log_data), log_data);
 		} else {
 			ast_log(LOG_WARNING, "Unable to open %s for writing call log for %s -- %d: %s\n", ast_str_buffer(path), pvt->session_id, errno, strerror(errno));
 		}
@@ -897,6 +956,7 @@ static int gdf_start(struct ast_speech *speech)
 	pvt->vad_state_duration = 0;
 	pvt->vad_change_duration = 0;
 	pvt->utterance_counter++;
+	pvt->request_start = ast_tvnow();
 	ast_mutex_unlock(&pvt->lock);
 
 	if (should_start_call_log(pvt)) {
@@ -915,7 +975,7 @@ static int gdf_start(struct ast_speech *speech)
 			{ "application", pvt->call_logging_application_name }
 		};
 		sprintf(utterance_number, "%d", pvt->utterance_counter);
-		gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "start", ARRAY_LEN(log_data), log_data);
+		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "start", ARRAY_LEN(log_data), log_data);
 	}
 	log_endpointer_start_event(pvt);
 	
@@ -1017,12 +1077,18 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 	return 0;
 }
 
-#ifdef ASTERISK_13_OR_LATER
+#ifdef AST_SPEECH_HAVE_GET_SETTING
 static int gdf_get_setting(struct ast_speech *speech, const char *name, char *buf, size_t len)
 {
 	struct gdf_pvt *pvt = speech->data;
 
-	if (!strcasecmp(name, GDF_PROP_SESSION_ID_NAME)) {
+	if (!strcasecmp(name, GDF_PROP_UTTERANCE_DURATION_MS)) {
+		long long last_audio_duration_ms;
+		ast_mutex_lock(&pvt->lock);
+		last_audio_duration_ms = pvt->last_audio_duration_ms;
+		ast_mutex_unlock(&pvt->lock);
+		ast_build_string(&buf, &len, "%lld", last_audio_duration_ms);
+	} else if (!strcasecmp(name, GDF_PROP_SESSION_ID_NAME)) {
 		ast_copy_string(buf, df_get_session_id(pvt->session), len);
 	} else if (!strcasecmp(name, GDF_PROP_PROJECT_ID_NAME)) {
 		ast_copy_string(buf, df_get_project_id(pvt->session), len);
@@ -1277,7 +1343,7 @@ static struct ast_str *load_service_key(const char *val)
 	}
 
 	if (strchr(val, '{')) {
-		ast_str_set(&buffer, 0, val);
+		ast_str_set(&buffer, 0, "%s", val);
 	} else {
 		FILE *f;
 		ast_log(LOG_DEBUG, "Loading service key data from %s\n", val);
@@ -1614,6 +1680,8 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 
 	if (type == CALL_LOG_TYPE_SESSION) {
 		char_type = "SESSION";
+	} else if (type == CALL_LOG_TYPE_RECOGNITION) {
+		char_type = "RECOGNITION";
 	} else if (type == CALL_LOG_TYPE_ENDPOINTER) {
 		char_type = "ENDPOINTER";
 	} else if (type == CALL_LOG_TYPE_DIALOGFLOW) {
@@ -1653,12 +1721,18 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 #endif
 }
 
-static void libdialogflow_general_logging_callback(enum dialogflow_log_level level, const char *file, int line, const char *function, const char *fmt, va_list args)
+static void libdialogflow_general_logging_callback(enum dialogflow_log_level level, 
+	const char *file, int line, const char *function, const char *fmt, va_list args)
+	__attribute__ ((format(printf, 5, 0)));
+
+static void libdialogflow_general_logging_callback(enum dialogflow_log_level level, 
+	const char *file, int line, const char *function, const char *fmt, va_list args)
 {
+	size_t len;
 	char *buff;
 	va_list args2;
 	va_copy(args2, args);
-    size_t len = vsnprintf(NULL, 0, fmt, args2);
+    len = vsnprintf(NULL, 0, fmt, args2);
     va_end(args2);
     buff = alloca(len + 1);
     vsnprintf(buff, len + 1, fmt, args);
@@ -1686,13 +1760,14 @@ static struct ast_speech_engine gdf_engine = {
 	.dtmf = gdf_dtmf,
 	.start = gdf_start,
 	.change = gdf_change,
-#ifdef ASTERISK_13_OR_LATER
+#ifdef AST_SPEECH_HAVE_GET_SETTING
 	.get_setting = gdf_get_setting,
 #endif
 	.change_results_type = gdf_change_results_type,
 	.get = gdf_get_results
 };
 
+#pragma GCC diagnostic ignored "-Wmissing-format-attribute"
 static enum ast_module_load_result load_module(void)
 {
 	struct gdf_config *cfg;
