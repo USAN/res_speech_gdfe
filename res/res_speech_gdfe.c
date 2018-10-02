@@ -72,6 +72,7 @@
 #define GDF_PROP_LOG_CONTEXT		"log_context"
 #define GDF_PROP_ALTERNATE_LOG_CONTEXT	"logContext"
 #define GDF_PROP_APPLICATION_CONTEXT	"application"
+#define GDF_PROP_REQUEST_SENTIMENT_ANALYSIS "request_sentiment_analysis"
 #define VAD_PROP_VOICE_THRESHOLD	"voice_threshold"
 #define VAD_PROP_VOICE_DURATION		"voice_duration"
 #define VAD_PROP_SILENCE_DURATION	"silence_duration"
@@ -100,6 +101,8 @@ struct gdf_pvt {
 	FILE *call_log_file_handle;
 
 	int utterance_counter;
+
+	int request_sentiment_analysis;
 
 	int utterance_preendpointer_recording_open_already_attempted;
 	FILE *utterance_preendpointer_recording_file_handle;
@@ -946,11 +949,13 @@ static int gdf_start(struct ast_speech *speech)
 	char *event = NULL;
 	char *language = NULL;
 	char *project_id = NULL;
+	int request_sentiment_analysis;
 
 	ast_mutex_lock(&pvt->lock);
 	event = ast_strdupa(pvt->event);
 	language = ast_strdupa(pvt->language);
 	project_id = ast_strdupa(pvt->project_id);
+	request_sentiment_analysis = pvt->request_sentiment_analysis;
 	ast_string_field_set(pvt, event, "");
 	pvt->vad_state = VAD_STATE_START;
 	pvt->vad_state_duration = 0;
@@ -962,6 +967,8 @@ static int gdf_start(struct ast_speech *speech)
 	if (should_start_call_log(pvt)) {
 		start_call_log(pvt);
 	}
+
+	df_set_request_sentiment_analysis(pvt->session, request_sentiment_analysis);
 
 	{
 		char utterance_number[11];
@@ -1069,6 +1076,10 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 			ast_log(LOG_WARNING, "Invalid value for " VAD_PROP_SILENCE_DURATION " -- '%s'\n", value);
 			return -1;
 		}
+	} else if (!strcasecmp(name, GDF_PROP_REQUEST_SENTIMENT_ANALYSIS)) {
+		ast_mutex_lock(&pvt->lock);
+		pvt->request_sentiment_analysis = ast_true(value);
+		ast_mutex_unlock(&pvt->lock);
 	} else {
 		ast_log(LOG_WARNING, "Unknown property '%s'\n", name);
 		return -1;
