@@ -150,6 +150,7 @@ struct gdf_logical_agent {
 	const char *project_id;
 	const char *service_key;
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
+	struct ao2_container *hints;
 	char endpoint[0];
 };
 
@@ -166,6 +167,7 @@ struct gdf_config {
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
 
 	struct ao2_container *logical_agents;
+	struct ao2_container *hints;
 
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(service_key);
@@ -1332,11 +1334,54 @@ static struct gdf_config *gdf_get_config(void)
 
 static void logical_agent_destructor(void *obj)
 {
+	struct gdf_logical_agent *agent = (struct gdf_logical_agent *) obj;
+	if (agent->hints) {
+		ao2_t_ref(agent->hints, -1, "destroying agent");
+	}
+}
+
+static int hint_hash_callback(const void *obj, const int flags)
+{
+	const char *hint = (const char *) obj;
+	return ast_str_case_hash(hint);
+}
+
+static int hint_compare_callback(void *obj, void *other, int flags)
+{
+	const char *hintA = obj;
+	const char *hintB = other;
+	return (!strcasecmp(hintA, hintB) ? CMP_MATCH | CMP_STOP : 0);
+}
+
+static void hint_destructor(void *obj)
+{
 	/* noop */
 }
 
+static void parse_hints(struct ao2_container *hints, const char *val)
+{
+	if (!ast_strlen_zero(val)) {
+		char *val_copy = ast_strdupa(val);
+		char *saved = NULL;
+		char *hint;
+
+		while ((hint = strtok_r(val_copy, ",", &saved))) {
+			char *ao2_hint;
+			hint = ast_strip(hint);
+			if (!ast_strlen_zero(hint)) {
+				ao2_hint = ao2_alloc(strlen(hint), hint_destructor);
+				if (ao2_hint) {
+					ao2_link(hints, ao2_hint);
+					ao2_t_ref(ao2_hint, -1, "linked hint on general load");
+				}
+			}
+		}
+	}
+}
+
 static struct gdf_logical_agent *logical_agent_alloc(const char *name, const char *project_id, 
-	const char *service_key, const char *endpoint, enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state)
+	const char *service_key, const char *endpoint, enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state,
+	const char *hints)
 {
 	size_t name_len = strlen(name);
 	size_t project_id_len = strlen(project_id);
@@ -1358,6 +1403,11 @@ static struct gdf_logical_agent *logical_agent_alloc(const char *name, const cha
 		agent->name = agent->project_id + project_id_len + 1;
 		ast_copy_string((char *)agent->name, name, name_len + 1);
 		agent->enable_sentiment_analysis = sentiment_analysis_state;
+
+		agent->hints = ao2_container_alloc(1, hint_hash_callback, hint_compare_callback);
+		if (agent->hints && !ast_strlen_zero(hints)) {
+			parse_hints(agent->hints, hints);
+		}
 	}
 
 	return agent;
@@ -1456,6 +1506,11 @@ static int load_config(int reload)
 			ast_log(LOG_WARNING, "Failed to allocate logical agent container for speech gdf\n");
 			ao2_ref(conf, -1);
 			ast_config_destroy(cfg);
+		}
+
+		conf->hints = ao2_container_alloc(1, hint_hash_callback, hint_compare_callback);
+		if (!conf->hints) {
+			ast_log(LOG_WARNING, "Failed to allocate hint container for speech gdf\n");
 		}
 
 		val = ast_variable_retrieve(cfg, "general", "service_key");
@@ -1564,6 +1619,13 @@ static int load_config(int reload)
 			}
 		}
 
+		if (conf->hints) {
+			val = ast_variable_retrieve(cfg, "general", "hints");
+			if (!ast_strlen_zero(val)) {
+				parse_hints(conf->hints, val);
+			}
+		}
+
 		category = NULL;
 		while ((category = ast_category_browse(cfg, category))) {
 			if (strcasecmp("general", category)) {
@@ -1572,6 +1634,7 @@ static int load_config(int reload)
 				const char *endpoint = ast_variable_retrieve(cfg, category, "endpoint");
 				const char *service_key = ast_variable_retrieve(cfg, category, "service_key");
 				const char *enable_sentiment_analysis = ast_variable_retrieve(cfg, category, "enable_sentiment_analysis");
+				const char *hints = ast_variable_retrieve(cfg, category, "hints");
 				enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state = SENTIMENT_ANALYSIS_DEFAULT;
 
 				if (!ast_strlen_zero(service_key)) {
@@ -1595,7 +1658,7 @@ static int load_config(int reload)
 				if (!ast_strlen_zero(project_id)) {
 					struct gdf_logical_agent *agent;
 					
-					agent = logical_agent_alloc(name, project_id, S_OR(service_key, ""), S_OR(endpoint, ""), sentiment_analysis_state);
+					agent = logical_agent_alloc(name, project_id, S_OR(service_key, ""), S_OR(endpoint, ""), sentiment_analysis_state, hints);
 					if (agent) {
 						ao2_link(conf->logical_agents, agent);
 						ao2_ref(agent, -1);
