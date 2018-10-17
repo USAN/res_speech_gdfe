@@ -1685,10 +1685,10 @@ static int load_config(int reload)
 		ao2_link(config, conf);
 		ao2_unlock(config);
 		ao2_ref(conf, -1);
-	}
 
 	if (cfg) {
 		ast_config_destroy(cfg);
+	}
 	}
 	
 	return AST_MODULE_LOAD_SUCCESS;
