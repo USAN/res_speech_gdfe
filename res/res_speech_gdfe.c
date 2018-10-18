@@ -125,6 +125,9 @@ struct gdf_pvt {
 	struct timeval request_start;
 	long long last_request_duration_ms;
 	long long last_audio_duration_ms; /* calculated by packet, not clock */
+
+	char **hints;
+	size_t hint_count;
 	
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(logical_agent_name);
@@ -150,6 +153,7 @@ struct gdf_logical_agent {
 	const char *project_id;
 	const char *service_key;
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
+	struct ao2_container *hints;
 	char endpoint[0];
 };
 
@@ -166,6 +170,7 @@ struct gdf_config {
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
 
 	struct ao2_container *logical_agents;
+	struct ao2_container *hints;
 
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(service_key);
@@ -292,6 +297,14 @@ static int gdf_destroy(struct ast_speech *speech)
 		ast_free(pvt->mulaw_endpointer_audio_cache);
 	}
 
+	if (pvt->hints) {
+		size_t i;
+		for (i = 0; i < pvt->hint_count; i++) {
+			ast_free(pvt->hints[i]);
+		}
+		ast_free(pvt->hints);
+	}
+
 	ast_string_field_free_memory(pvt);
 	ast_mutex_destroy(&pvt->lock);
 	ast_free(pvt);
@@ -341,6 +354,49 @@ static void calculate_effective_sentiment_analysis_state(struct gdf_pvt *pvt_loc
 	}
 }
 
+static void calculate_effective_hints(struct gdf_pvt *pvt_locked, struct gdf_config *config, struct gdf_logical_agent *logical_agent)
+{
+	struct ao2_container *hint_container = NULL;
+
+	if (pvt_locked->hints) {
+		size_t i;
+		for (i = 0; i < pvt_locked->hint_count; i++) {
+			ast_free(pvt_locked->hints[i]);
+		}
+		ast_free(pvt_locked->hints);
+		pvt_locked->hints = NULL;
+	}
+
+	pvt_locked->hint_count = 0;
+
+	if (logical_agent) {
+		hint_container = logical_agent->hints;
+	}
+	if (hint_container == NULL || !ao2_container_count(hint_container)) {
+		hint_container = config->hints;
+	}
+
+	if (hint_container) {
+		size_t hint_count = ao2_container_count(hint_container);
+		if (hint_count > 0) {
+			pvt_locked->hints = ast_calloc(hint_count, sizeof(char *));
+			if (pvt_locked->hints) {
+				size_t i;
+				struct ao2_iterator hint_iterator;
+				char *entry;
+
+				hint_iterator = ao2_iterator_init(hint_container, 0);
+				for (i = 0, entry = ao2_iterator_next(&hint_iterator); entry && i < hint_count; i++, entry = ao2_iterator_next(&hint_iterator)) {
+					pvt_locked->hints[i] = ast_strdup(entry);
+					pvt_locked->hint_count = i + 1;
+					ao2_ref(entry, -1);
+				}
+				ao2_iterator_destroy(&hint_iterator);
+			}
+		}
+	}
+}
+
 static void activate_agent_for_name(struct gdf_pvt *pvt, const char *name, size_t name_len, const char *event)
 {
 	struct gdf_config *config;
@@ -358,6 +414,7 @@ static void activate_agent_for_name(struct gdf_pvt *pvt, const char *name, size_
 		ast_string_field_set(pvt, endpoint, S_OR(logical_agent_map ? logical_agent_map->endpoint : NULL, config->endpoint));
 		ast_string_field_set(pvt, event, event);
 		calculate_effective_sentiment_analysis_state(pvt, config, logical_agent_map);
+		calculate_effective_hints(pvt, config, logical_agent_map);
 		ast_mutex_unlock(&pvt->lock);
 		if (logical_agent_map) {
 			ao2_ref(logical_agent_map, -1);
@@ -758,7 +815,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 #endif
 
 	if (vad_state == VAD_STATE_SPEAK && orig_vad_state == VAD_STATE_START) {
-		if (df_start_recognition(pvt->session, pvt->language, 0)) {
+		if (df_start_recognition(pvt->session, pvt->language, 0, (const char **)pvt->hints, pvt->hint_count)) {
 			ast_log(LOG_WARNING, "Error starting recognition on %s\n", pvt->session_id);
 			gdf_stop_recognition(speech, pvt);
 		}
@@ -1332,11 +1389,43 @@ static struct gdf_config *gdf_get_config(void)
 
 static void logical_agent_destructor(void *obj)
 {
+	struct gdf_logical_agent *agent = (struct gdf_logical_agent *) obj;
+	if (agent->hints) {
+		ao2_t_ref(agent->hints, -1, "destroying agent");
+	}
+}
+
+static void hint_destructor(void *obj)
+{
 	/* noop */
 }
 
+static void parse_hints(struct ao2_container *hints, const char *val)
+{
+	if (!ast_strlen_zero(val)) {
+		char *val_copy = ast_strdupa(val);
+		char *saved = NULL;
+		char *hint;
+
+		for (hint = strtok_r(val_copy, ",", &saved); hint; hint = strtok_r(NULL, ",", &saved)) {
+			char *ao2_hint;
+			hint = ast_strip(hint);
+			if (!ast_strlen_zero(hint)) {
+				size_t len = strlen(hint);
+				ao2_hint = ao2_alloc(len + 1, hint_destructor);
+				if (ao2_hint) {
+					ast_copy_string(ao2_hint, hint, len + 1);
+					ao2_link(hints, ao2_hint);
+					ao2_t_ref(ao2_hint, -1, "linked hint on general load");
+				}
+			}
+		}
+	}
+}
+
 static struct gdf_logical_agent *logical_agent_alloc(const char *name, const char *project_id, 
-	const char *service_key, const char *endpoint, enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state)
+	const char *service_key, const char *endpoint, enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state,
+	const char *hints)
 {
 	size_t name_len = strlen(name);
 	size_t project_id_len = strlen(project_id);
@@ -1358,6 +1447,11 @@ static struct gdf_logical_agent *logical_agent_alloc(const char *name, const cha
 		agent->name = agent->project_id + project_id_len + 1;
 		ast_copy_string((char *)agent->name, name, name_len + 1);
 		agent->enable_sentiment_analysis = sentiment_analysis_state;
+
+		agent->hints = ao2_container_alloc(1, NULL, NULL);
+		if (agent->hints && !ast_strlen_zero(hints)) {
+			parse_hints(agent->hints, hints);
+		}
 	}
 
 	return agent;
@@ -1456,6 +1550,11 @@ static int load_config(int reload)
 			ast_log(LOG_WARNING, "Failed to allocate logical agent container for speech gdf\n");
 			ao2_ref(conf, -1);
 			ast_config_destroy(cfg);
+		}
+
+		conf->hints = ao2_container_alloc(1, NULL, NULL);
+		if (!conf->hints) {
+			ast_log(LOG_WARNING, "Failed to allocate hint container for speech gdf\n");
 		}
 
 		val = ast_variable_retrieve(cfg, "general", "service_key");
@@ -1564,6 +1663,13 @@ static int load_config(int reload)
 			}
 		}
 
+		if (conf->hints) {
+			val = ast_variable_retrieve(cfg, "general", "hints");
+			if (!ast_strlen_zero(val)) {
+				parse_hints(conf->hints, val);
+			}
+		}
+
 		category = NULL;
 		while ((category = ast_category_browse(cfg, category))) {
 			if (strcasecmp("general", category)) {
@@ -1572,6 +1678,7 @@ static int load_config(int reload)
 				const char *endpoint = ast_variable_retrieve(cfg, category, "endpoint");
 				const char *service_key = ast_variable_retrieve(cfg, category, "service_key");
 				const char *enable_sentiment_analysis = ast_variable_retrieve(cfg, category, "enable_sentiment_analysis");
+				const char *hints = ast_variable_retrieve(cfg, category, "hints");
 				enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state = SENTIMENT_ANALYSIS_DEFAULT;
 
 				if (!ast_strlen_zero(service_key)) {
@@ -1595,7 +1702,7 @@ static int load_config(int reload)
 				if (!ast_strlen_zero(project_id)) {
 					struct gdf_logical_agent *agent;
 					
-					agent = logical_agent_alloc(name, project_id, S_OR(service_key, ""), S_OR(endpoint, ""), sentiment_analysis_state);
+					agent = logical_agent_alloc(name, project_id, S_OR(service_key, ""), S_OR(endpoint, ""), sentiment_analysis_state, hints);
 					if (agent) {
 						ao2_link(conf->logical_agents, agent);
 						ao2_ref(agent, -1);
@@ -1622,10 +1729,10 @@ static int load_config(int reload)
 		ao2_link(config, conf);
 		ao2_unlock(config);
 		ao2_ref(conf, -1);
-	}
 
-	if (cfg) {
-		ast_config_destroy(cfg);
+		if (cfg) {
+			ast_config_destroy(cfg);
+		}
 	}
 	
 	return AST_MODULE_LOAD_SUCCESS;
@@ -1668,6 +1775,8 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 		config = gdf_get_config();
 		if (config) {
 			struct ao2_iterator i;
+			struct ao2_iterator h;
+			char *hint;
 			struct gdf_logical_agent *agent;
 
 			ast_cli(a->fd, "[general]\n");
@@ -1681,12 +1790,28 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "enable_call_logs = %s\n", AST_CLI_YESNO(config->enable_call_logs));
 			ast_cli(a->fd, "enable_preendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_preendpointer_recordings));
 			ast_cli(a->fd, "enable_postendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_postendpointer_recordings));
+			ast_cli(a->fd, "hints = ");
+			h = ao2_iterator_init(config->hints, 0);
+			while ((hint = ao2_iterator_next(&h))) {
+				ast_cli(a->fd, "%s, ", hint);
+				ao2_ref(hint, -1);
+			}
+			ast_cli(a->fd, "\n");
+			ao2_iterator_destroy(&h);
 			i = ao2_iterator_init(config->logical_agents, 0);
 			while ((agent = ao2_iterator_next(&i))) {
 				ast_cli(a->fd, "\n[%s]\n", agent->name);
 				ast_cli(a->fd, "project_id = %s\n", agent->project_id);
 				ast_cli(a->fd, "endpoint = %s\n", agent->endpoint);
 				ast_cli(a->fd, "service_key = %s\n", agent->service_key);
+				ast_cli(a->fd, "hints = ");
+				h = ao2_iterator_init(agent->hints, 0);
+				while ((hint = ao2_iterator_next(&h))) {
+					ast_cli(a->fd, "%s, ", hint);
+					ao2_ref(hint, -1);
+				}
+				ast_cli(a->fd, "\n");
+				ao2_iterator_destroy(&h);
 				ao2_ref(agent, -1);
 			}
 			ao2_iterator_destroy(&i);
@@ -1767,7 +1892,17 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 	ast_json_object_set(log_message, "log_type", ast_json_string_create(char_type));
 	ast_json_object_set(log_message, "log_event", ast_json_string_create(event));
 	for (i = 0; i < log_data_size; i++) {
-		ast_json_object_set(log_message, log_data[i].name, ast_json_string_create(log_data[i].value));
+		if (log_data[i].value_type == dialogflow_log_data_value_type_string) {
+			ast_json_object_set(log_message, log_data[i].name, ast_json_string_create((const char *)log_data[i].value));
+		} else if (log_data[i].value_type == dialogflow_log_data_value_type_array_of_string) {
+			size_t j;
+			RAII_VAR(struct ast_json *, array, ast_json_array_create(), ast_json_unref);
+
+			for (j = 0; j < log_data[i].value_count; j++) {
+				ast_json_array_append(log_message, json_string(((const char **)log_data[i].value)[j]));
+			}
+			ast_json_object_set(log_message, log_data[i].name, ast_json_ref(array));
+		}
 	}
 	log_line = ast_json_dump_string(log_message);
 #else
@@ -1776,7 +1911,17 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 	json_object_set_new(log_message, "log_type", json_string(char_type));
 	json_object_set_new(log_message, "log_event", json_string(event));
 	for (i = 0; i < log_data_size; i++) {
-		json_object_set_new(log_message, log_data[i].name, json_string(log_data[i].value));
+		if (log_data[i].value_type == dialogflow_log_data_value_type_string) {
+			json_object_set_new(log_message, log_data[i].name, json_string((const char *)log_data[i].value));
+		} else if (log_data[i].value_type == dialogflow_log_data_value_type_array_of_string) {
+			size_t j;
+			json_t *array = json_array();
+
+			for (j = 0; j < log_data[i].value_count; j++) {
+				json_array_append_new(array, json_string(((const char **)log_data[i].value)[j]));
+			}
+			json_object_set_new(log_message, log_data[i].name, array);
+		}
 	}
 	log_line = json_dumps(log_message, JSON_COMPACT);
 #endif
