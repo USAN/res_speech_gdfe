@@ -1923,7 +1923,11 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 			json_object_set_new(log_message, log_data[i].name, array);
 		}
 	}
+#if JANSSON_MAJOR_VERSION > 2 || (JANSSON_MAJOR_VERSION == 2 && JANSSON_MINOR_VERSION >= 8)
 	log_line = json_dumps(log_message, JSON_COMPACT);
+#else
+	log_line = json_dumps(log_message, JSON_COMPACT | JSON_PRESERVE_ORDER);
+#endif
 #endif
 
 	ast_mutex_lock(&pvt->lock);
