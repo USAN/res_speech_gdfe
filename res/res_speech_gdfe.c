@@ -707,9 +707,10 @@ static void close_preendpointed_audio_recording(struct gdf_pvt *pvt)
 	if (pvt->utterance_preendpointer_recording_file_handle) {
 		fclose(pvt->utterance_preendpointer_recording_file_handle);
 		pvt->utterance_preendpointer_recording_file_handle = NULL;
+		gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "pre_recording_stop");
 	}
+	pvt->utterance_preendpointer_recording_open_already_attempted = 0;
 	ast_mutex_unlock(&pvt->lock);
-	gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "pre_recording_stop");
 }
 
 static void close_postendpointed_audio_recording(struct gdf_pvt *pvt)
@@ -718,9 +719,10 @@ static void close_postendpointed_audio_recording(struct gdf_pvt *pvt)
 	if (pvt->utterance_postendpointer_recording_file_handle) {
 		fclose(pvt->utterance_postendpointer_recording_file_handle);
 		pvt->utterance_postendpointer_recording_file_handle = NULL;
+		gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "post_recording_stop");
 	}
+	pvt->utterance_postendpointer_recording_open_already_attempted = 0;
 	ast_mutex_unlock(&pvt->lock);
-	gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "post_recording_stop");
 }
 
 static int gdf_stop_recognition(struct ast_speech *speech, struct gdf_pvt *pvt)
