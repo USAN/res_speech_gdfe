@@ -816,7 +816,8 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 		orig_vad_state, vad_state);
 #endif
 
-	if (vad_state == VAD_STATE_SPEAK && orig_vad_state == VAD_STATE_START) {
+	state = df_get_state(pvt->session);
+	if (state == DF_STATE_READY) {
 		if (df_start_recognition(pvt->session, pvt->language, 0, (const char **)pvt->hints, pvt->hint_count)) {
 			ast_log(LOG_WARNING, "Error starting recognition on %s\n", pvt->session_id);
 			gdf_stop_recognition(speech, pvt);
@@ -833,8 +834,8 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	maybe_record_audio(pvt, mulaw, mulaw_len, vad_state);
 	maybe_cache_preendpointed_audio(pvt, mulaw, mulaw_len, vad_state);
 
+	state = df_get_state(pvt->session);
 	if (vad_state != VAD_STATE_START) {
-		state = df_get_state(pvt->session);
 		if (orig_vad_state == VAD_STATE_START) {
 			size_t flush_start = 0;
 
@@ -867,11 +868,10 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 			ast_set_flag(speech, AST_SPEECH_QUIET);
 			ast_set_flag(speech, AST_SPEECH_SPOKE);
 		}
-
-		if (state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
-			df_stop_recognition(pvt->session);
-			gdf_stop_recognition(speech, pvt);
-		}
+	}
+	if (state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
+		df_stop_recognition(pvt->session);
+		gdf_stop_recognition(speech, pvt);
 	}
 
 	return 0;
@@ -1925,11 +1925,7 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 			json_object_set_new(log_message, log_data[i].name, array);
 		}
 	}
-#if JANSSON_MAJOR_VERSION > 2 || (JANSSON_MAJOR_VERSION == 2 && JANSSON_MINOR_VERSION >= 8)
-	log_line = json_dumps(log_message, JSON_COMPACT);
-#else
 	log_line = json_dumps(log_message, JSON_COMPACT | JSON_PRESERVE_ORDER);
-#endif
 #endif
 
 	ast_mutex_lock(&pvt->lock);
