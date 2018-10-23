@@ -707,9 +707,10 @@ static void close_preendpointed_audio_recording(struct gdf_pvt *pvt)
 	if (pvt->utterance_preendpointer_recording_file_handle) {
 		fclose(pvt->utterance_preendpointer_recording_file_handle);
 		pvt->utterance_preendpointer_recording_file_handle = NULL;
+		gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "pre_recording_stop");
 	}
+	pvt->utterance_preendpointer_recording_open_already_attempted = 0;
 	ast_mutex_unlock(&pvt->lock);
-	gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "pre_recording_stop");
 }
 
 static void close_postendpointed_audio_recording(struct gdf_pvt *pvt)
@@ -718,9 +719,10 @@ static void close_postendpointed_audio_recording(struct gdf_pvt *pvt)
 	if (pvt->utterance_postendpointer_recording_file_handle) {
 		fclose(pvt->utterance_postendpointer_recording_file_handle);
 		pvt->utterance_postendpointer_recording_file_handle = NULL;
+		gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "post_recording_stop");
 	}
+	pvt->utterance_postendpointer_recording_open_already_attempted = 0;
 	ast_mutex_unlock(&pvt->lock);
-	gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "post_recording_stop");
 }
 
 static int gdf_stop_recognition(struct ast_speech *speech, struct gdf_pvt *pvt)
@@ -1923,7 +1925,11 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 			json_object_set_new(log_message, log_data[i].name, array);
 		}
 	}
+#if JANSSON_MAJOR_VERSION > 2 || (JANSSON_MAJOR_VERSION == 2 && JANSSON_MINOR_VERSION >= 8)
 	log_line = json_dumps(log_message, JSON_COMPACT);
+#else
+	log_line = json_dumps(log_message, JSON_COMPACT | JSON_PRESERVE_ORDER);
+#endif
 #endif
 
 	ast_mutex_lock(&pvt->lock);
