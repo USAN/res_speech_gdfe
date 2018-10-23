@@ -816,7 +816,8 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 		orig_vad_state, vad_state);
 #endif
 
-	if (vad_state == VAD_STATE_SPEAK && orig_vad_state == VAD_STATE_START) {
+	state = df_get_state(pvt->session);
+	if (state == DF_STATE_READY) {
 		if (df_start_recognition(pvt->session, pvt->language, 0, (const char **)pvt->hints, pvt->hint_count)) {
 			ast_log(LOG_WARNING, "Error starting recognition on %s\n", pvt->session_id);
 			gdf_stop_recognition(speech, pvt);
@@ -833,8 +834,8 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	maybe_record_audio(pvt, mulaw, mulaw_len, vad_state);
 	maybe_cache_preendpointed_audio(pvt, mulaw, mulaw_len, vad_state);
 
+	state = df_get_state(pvt->session);
 	if (vad_state != VAD_STATE_START) {
-		state = df_get_state(pvt->session);
 		if (orig_vad_state == VAD_STATE_START) {
 			size_t flush_start = 0;
 
@@ -867,11 +868,10 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 			ast_set_flag(speech, AST_SPEECH_QUIET);
 			ast_set_flag(speech, AST_SPEECH_SPOKE);
 		}
-
-		if (state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
-			df_stop_recognition(pvt->session);
-			gdf_stop_recognition(speech, pvt);
-		}
+	}
+	if (state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
+		df_stop_recognition(pvt->session);
+		gdf_stop_recognition(speech, pvt);
 	}
 
 	return 0;
