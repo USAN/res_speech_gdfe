@@ -1187,18 +1187,16 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 		ast_mutex_lock(&pvt->lock);
 		pvt->request_sentiment_analysis = ast_true(value);
 		ast_mutex_unlock(&pvt->lock);
-<<<<<<< HEAD
-=======
 	} else if (!strcasecmp(name, "logPromptStart")) {
 		struct dialogflow_log_data log_data[] = {
 			{ "prompt", S_OR(value, "") }
 		};
-		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "promptStart", ARRAY_LEN(log_data), log_data);
+		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "prompt_start", ARRAY_LEN(log_data), log_data);
 	} else if (!strcasecmp(name, "logPromptStop")) {
 		struct dialogflow_log_data log_data[] = {
 			{ "reason", S_OR(value, "none") }
 		};
-		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "promptStop", ARRAY_LEN(log_data), log_data);
+		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "prompt_stop", ARRAY_LEN(log_data), log_data);
 	} else if (!strcasecmp(name, "logDtmf")) {
 		struct dialogflow_log_data log_data[] = {
 			{ "digits", S_OR(value, "") }
@@ -1208,9 +1206,8 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 		ast_mutex_lock(&pvt->lock);
 		pvt->record_next_utterance = ast_true(value);
 		ast_mutex_unlock(&pvt->lock);
->>>>>>> e91272f... Add ability to record on demand
 	} else {
-		ast_log(LOG_WARNING, "Unknown property '%s'\n", name);
+		ast_log(LOG_DEBUG, "Unknown property '%s'\n", name);
 		return -1;
 	}
 
