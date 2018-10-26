@@ -111,6 +111,8 @@ struct gdf_pvt {
 	enum SENTIMENT_ANALYSIS_STATE effective_sentiment_analysis_state;
 	int request_sentiment_analysis;
 
+	int record_next_utterance;
+
 	int utterance_preendpointer_recording_open_already_attempted;
 	FILE *utterance_preendpointer_recording_file_handle;
 	int utterance_postendpointer_recording_open_already_attempted;
@@ -167,6 +169,7 @@ struct gdf_config {
 	int enable_call_logs;
 	int enable_preendpointer_recordings;
 	int enable_postendpointer_recordings;
+	int record_preendpointer_on_demand;
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
 
 	struct ao2_container *logical_agents;
@@ -604,6 +607,7 @@ static void maybe_record_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mu
 	struct gdf_config *config = gdf_get_config();
 	int enable_preendpointer_recordings = 0;
 	int enable_postendpointer_recordings = 0;
+	int record_preendpointer_on_demand = 0;
 	int currently_recording_preendpointed_audio = 0;
 	int currently_recording_postendpointed_audio = 0;
 	int already_attempted_open_for_preendpointed_audio = 0;
@@ -612,8 +616,17 @@ static void maybe_record_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mu
 	if (config) {
 		enable_preendpointer_recordings = config->enable_preendpointer_recordings;
 		enable_postendpointer_recordings = config->enable_postendpointer_recordings;		
+		record_preendpointer_on_demand = config->record_preendpointer_on_demand;
 		ao2_t_ref(config, -1, "done with config checking for recording");
 	}
+
+	ast_mutex_lock(&pvt->lock);
+	enable_postendpointer_recordings |= pvt->record_next_utterance;
+	if (record_preendpointer_on_demand) {
+		enable_preendpointer_recordings |= pvt->record_next_utterance;
+	}
+	pvt->record_next_utterance = 0;
+	ast_mutex_unlock(&pvt->lock);
 
 	if (enable_postendpointer_recordings || enable_preendpointer_recordings) {
 		int have_call_log_path;
@@ -1174,8 +1187,27 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 		ast_mutex_lock(&pvt->lock);
 		pvt->request_sentiment_analysis = ast_true(value);
 		ast_mutex_unlock(&pvt->lock);
+	} else if (!strcasecmp(name, "logPromptStart")) {
+		struct dialogflow_log_data log_data[] = {
+			{ "prompt", S_OR(value, "") }
+		};
+		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "prompt_start", ARRAY_LEN(log_data), log_data);
+	} else if (!strcasecmp(name, "logPromptStop")) {
+		struct dialogflow_log_data log_data[] = {
+			{ "reason", S_OR(value, "none") }
+		};
+		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "prompt_stop", ARRAY_LEN(log_data), log_data);
+	} else if (!strcasecmp(name, "logDtmf")) {
+		struct dialogflow_log_data log_data[] = {
+			{ "digits", S_OR(value, "") }
+		};
+		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "digits", ARRAY_LEN(log_data), log_data);
+	} else if (!strcasecmp(name, "record") || !strcasecmp(name, "recordUtterance")) {
+		ast_mutex_lock(&pvt->lock);
+		pvt->record_next_utterance = ast_true(value);
+		ast_mutex_unlock(&pvt->lock);
 	} else {
-		ast_log(LOG_WARNING, "Unknown property '%s'\n", name);
+		ast_log(LOG_DEBUG, "Unknown property '%s'\n", name);
 		return -1;
 	}
 
@@ -1653,6 +1685,12 @@ static int load_config(int reload)
 			conf->enable_postendpointer_recordings = ast_true(val);
 		}
 
+		conf->record_preendpointer_on_demand = 0;
+		val = ast_variable_retrieve(cfg, "general", "record_preendpointer_on_demand");
+		if (!ast_strlen_zero(val)) {
+			conf->record_preendpointer_on_demand = ast_true(val);
+		}
+
 		conf->enable_sentiment_analysis = SENTIMENT_ANALYSIS_DEFAULT;
 		val = ast_variable_retrieve(cfg, "general", "enable_sentiment_analysis");
 		if (!ast_strlen_zero(val)) {
@@ -1792,6 +1830,7 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "enable_call_logs = %s\n", AST_CLI_YESNO(config->enable_call_logs));
 			ast_cli(a->fd, "enable_preendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_preendpointer_recordings));
 			ast_cli(a->fd, "enable_postendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_postendpointer_recordings));
+			ast_cli(a->fd, "record_preendpointer_on_demand = %s\n", AST_CLI_YESNO(config->record_preendpointer_on_demand));
 			ast_cli(a->fd, "hints = ");
 			h = ao2_iterator_init(config->hints, 0);
 			while ((hint = ao2_iterator_next(&h))) {
