@@ -172,6 +172,8 @@ struct gdf_config {
 	int record_preendpointer_on_demand;
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
 
+	int start_recognition_on_start; /* vs. on speech */
+
 	struct ao2_container *logical_agents;
 	struct ao2_container *hints;
 
@@ -766,6 +768,8 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	int mulaw_len;
 	char *mulaw;
 	int i;
+	int start_recognition_on_start;
+	struct gdf_config *cfg;
 
 	datasamples = len / sizeof(short); /* 2 bytes per sample for slin */;
 	datams = datasamples / 8; /* 8 samples per millisecond */;
@@ -780,6 +784,12 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	voice_duration = pvt->voice_minimum_duration;
 	silence_duration = pvt->silence_minimum_duration;
 	ast_mutex_unlock(&pvt->lock);
+
+	cfg = gdf_get_config();
+	if (cfg) {
+		start_recognition_on_start = cfg->start_recognition_on_start;
+		ao2_t_ref(cfg, -1, "done checking for starting rec on call start");
+	}
 
 	cur_duration += datams;
 
@@ -830,7 +840,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 #endif
 
 	state = df_get_state(pvt->session);
-	if (state == DF_STATE_READY) {
+	if (state == DF_STATE_READY && start_recognition_on_start) {
 		if (df_start_recognition(pvt->session, pvt->language, 0, (const char **)pvt->hints, pvt->hint_count)) {
 			ast_log(LOG_WARNING, "Error starting recognition on %s\n", pvt->session_id);
 			gdf_stop_recognition(speech, pvt);
@@ -850,24 +860,37 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	state = df_get_state(pvt->session);
 	if (vad_state != VAD_STATE_START) {
 		if (orig_vad_state == VAD_STATE_START) {
-			size_t flush_start = 0;
-
-			coalesce_cached_audio_for_writing(pvt);
-
-			while (flush_start < pvt->mulaw_endpointer_audio_cache_len && state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
-				if (flush_start + mulaw_len <= pvt->mulaw_endpointer_audio_cache_len) {
-					state = df_write_audio(pvt->session, pvt->mulaw_endpointer_audio_cache + flush_start, mulaw_len);
-					flush_start += mulaw_len;
-				} else {
-					size_t partial_write_size = pvt->mulaw_endpointer_audio_cache_len - flush_start;
-					state = df_write_audio(pvt->session, pvt->mulaw_endpointer_audio_cache + flush_start, partial_write_size);
-					flush_start += partial_write_size;
+			if (state == DF_STATE_READY && !start_recognition_on_start) {
+				if (df_start_recognition(pvt->session, pvt->language, 0, (const char **)pvt->hints, pvt->hint_count)) {
+					ast_log(LOG_WARNING, "Error starting recognition on %s\n", pvt->session_id);
+					gdf_stop_recognition(speech, pvt);
+					state = df_get_state(pvt->session);
 				}
+				ast_mutex_lock(&pvt->lock);
+				pvt->last_audio_duration_ms = 0;
+				ast_mutex_unlock(&pvt->lock);
 			}
 
-			ast_mutex_lock(&pvt->lock);
-			pvt->last_audio_duration_ms += flush_start / 8;
-			ast_mutex_unlock(&pvt->lock);
+			if (state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
+				size_t flush_start = 0;
+
+				coalesce_cached_audio_for_writing(pvt);
+
+				while (flush_start < pvt->mulaw_endpointer_audio_cache_len && state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
+					if (flush_start + mulaw_len <= pvt->mulaw_endpointer_audio_cache_len) {
+						state = df_write_audio(pvt->session, pvt->mulaw_endpointer_audio_cache + flush_start, mulaw_len);
+						flush_start += mulaw_len;
+					} else {
+						size_t partial_write_size = pvt->mulaw_endpointer_audio_cache_len - flush_start;
+						state = df_write_audio(pvt->session, pvt->mulaw_endpointer_audio_cache + flush_start, partial_write_size);
+						flush_start += partial_write_size;
+					}
+				}
+
+				ast_mutex_lock(&pvt->lock);
+				pvt->last_audio_duration_ms += flush_start / 8;
+				ast_mutex_unlock(&pvt->lock);
+			}
 		}
 		if (state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
 			state = df_write_audio(pvt->session, mulaw, mulaw_len);
@@ -1703,6 +1726,12 @@ static int load_config(int reload)
 			}
 		}
 
+		conf->start_recognition_on_start = 0;
+		val = ast_variable_retrieve(cfg, "general", "start_recognition_on_start");
+		if (!ast_strlen_zero(val)) {
+			conf->start_recognition_on_start = ast_true(val);
+		}
+
 		if (conf->hints) {
 			val = ast_variable_retrieve(cfg, "general", "hints");
 			if (!ast_strlen_zero(val)) {
@@ -1831,6 +1860,9 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "enable_preendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_preendpointer_recordings));
 			ast_cli(a->fd, "enable_postendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_postendpointer_recordings));
 			ast_cli(a->fd, "record_preendpointer_on_demand = %s\n", AST_CLI_YESNO(config->record_preendpointer_on_demand));
+			ast_cli(a->fd, "enable_sentiment_analysis = %s\n", config->enable_sentiment_analysis == SENTIMENT_ANALYSIS_ALWAYS ? "always" :
+																config->enable_sentiment_analysis == SENTIMENT_ANALYSIS_DEFAULT ? "default" : "never");
+			ast_cli(a->fd, "start_recognition_on_start = %s\n", AST_CLI_YESNO(config->start_recognition_on_start));
 			ast_cli(a->fd, "hints = ");
 			h = ao2_iterator_init(config->hints, 0);
 			while ((hint = ao2_iterator_next(&h))) {
@@ -1845,6 +1877,8 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 				ast_cli(a->fd, "project_id = %s\n", agent->project_id);
 				ast_cli(a->fd, "endpoint = %s\n", agent->endpoint);
 				ast_cli(a->fd, "service_key = %s\n", agent->service_key);
+				ast_cli(a->fd, "enable_sentiment_analysis = %s\n", agent->enable_sentiment_analysis == SENTIMENT_ANALYSIS_ALWAYS ? "always" :
+																	agent->enable_sentiment_analysis == SENTIMENT_ANALYSIS_DEFAULT ? "default" : "never");
 				ast_cli(a->fd, "hints = ");
 				h = ao2_iterator_init(agent->hints, 0);
 				while ((hint = ao2_iterator_next(&h))) {
