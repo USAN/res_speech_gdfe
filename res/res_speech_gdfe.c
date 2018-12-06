@@ -768,7 +768,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	int mulaw_len;
 	char *mulaw;
 	int i;
-	int start_recognition_on_start;
+	int start_recognition_on_start = 0;
 	struct gdf_config *cfg;
 
 	datasamples = len / sizeof(short); /* 2 bytes per sample for slin */;
