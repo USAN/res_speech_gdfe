@@ -750,6 +750,20 @@ static int gdf_stop_recognition(struct ast_speech *speech, struct gdf_pvt *pvt)
 	return 0;
 }
 
+static int gdf_state_changed(struct ast_speech *speech, int old_state, int new_state)
+{
+	struct gdf_pvt *pvt = speech->data;
+
+	if (new_state == AST_SPEECH_STATE_NOT_READY) {
+		gdf_log_call_event_only(pvt, CALL_LOG_TYPE_RECOGNITION, "cancelled");
+
+		df_stop_recognition(pvt->session);
+		gdf_stop_recognition(speech, pvt);
+	}
+
+	return 0;
+}
+
 /* speech structure is locked */
 static int gdf_write(struct ast_speech *speech, void *data, int len)
 {
@@ -2057,7 +2071,8 @@ static struct ast_speech_engine gdf_engine = {
 	.get_setting = gdf_get_setting,
 #endif
 	.change_results_type = gdf_change_results_type,
-	.get = gdf_get_results
+	.get = gdf_get_results,
+	.state_changed = gdf_state_changed
 };
 
 #pragma GCC diagnostic ignored "-Wmissing-format-attribute"
