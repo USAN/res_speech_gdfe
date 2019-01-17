@@ -658,7 +658,7 @@ static void maybe_record_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mu
 		}
 	}
 
-	if (enable_postendpointer_recordings && current_vad_state == VAD_STATE_SPEAK) {
+	if (enable_postendpointer_recordings && current_vad_state != VAD_STATE_START) {
 		int need_to_dump_cached_audio = 0;
 		if (!currently_recording_postendpointed_audio && !already_attempted_open_for_postendpointed_audio) {
 			if (!open_postendpointed_recording_file(pvt)) {
