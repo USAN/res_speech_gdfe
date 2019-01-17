@@ -658,7 +658,7 @@ static void maybe_record_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mu
 		}
 	}
 
-	if (enable_postendpointer_recordings && current_vad_state == VAD_STATE_SPEAK) {
+	if (enable_postendpointer_recordings && current_vad_state != VAD_STATE_START) {
 		int need_to_dump_cached_audio = 0;
 		if (!currently_recording_postendpointed_audio && !already_attempted_open_for_postendpointed_audio) {
 			if (!open_postendpointed_recording_file(pvt)) {
@@ -747,6 +747,20 @@ static int gdf_stop_recognition(struct ast_speech *speech, struct gdf_pvt *pvt)
 	ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
 	pvt->last_request_duration_ms = ast_tvdiff_ms(ast_tvnow(), pvt->request_start);
 	write_end_of_recognition_call_event(pvt);
+	return 0;
+}
+
+static int gdf_state_changed(struct ast_speech *speech, int old_state, int new_state)
+{
+	struct gdf_pvt *pvt = speech->data;
+
+	if (new_state == AST_SPEECH_STATE_NOT_READY) {
+		gdf_log_call_event_only(pvt, CALL_LOG_TYPE_RECOGNITION, "cancelled");
+
+		df_stop_recognition(pvt->session);
+		gdf_stop_recognition(speech, pvt);
+	}
+
 	return 0;
 }
 
@@ -1124,6 +1138,7 @@ static int gdf_start(struct ast_speech *speech)
 			gdf_stop_recognition(speech, pvt);
 		}
 	} else {
+		df_connect(pvt->session);
 		ast_speech_change_state(speech, AST_SPEECH_STATE_READY);
 	}
 
@@ -2056,7 +2071,8 @@ static struct ast_speech_engine gdf_engine = {
 	.get_setting = gdf_get_setting,
 #endif
 	.change_results_type = gdf_change_results_type,
-	.get = gdf_get_results
+	.get = gdf_get_results,
+	.state_changed = gdf_state_changed
 };
 
 #pragma GCC diagnostic ignored "-Wmissing-format-attribute"
