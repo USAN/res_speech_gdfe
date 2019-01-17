@@ -1124,6 +1124,7 @@ static int gdf_start(struct ast_speech *speech)
 			gdf_stop_recognition(speech, pvt);
 		}
 	} else {
+		df_connect(pvt->session);
 		ast_speech_change_state(speech, AST_SPEECH_STATE_READY);
 	}
 
