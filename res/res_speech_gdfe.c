@@ -787,11 +787,14 @@ static int gdf_stop_recognition(struct gdf_pvt *pvt)
 {
 	close_preendpointed_audio_recording(pvt);
 	close_postendpointed_audio_recording(pvt);
+	df_stop_recognition(pvt->session);
 	ao2_lock(pvt);
 	if (pvt->speech) {
 		ast_speech_change_state(pvt->speech, AST_SPEECH_STATE_DONE); /* okay to call this locked */
 	}
+	if (pvt->state != GDFE_STATE_DONE) {
 	pvt->state = GDFE_STATE_HAVE_RESULTS;
+	}
 	pvt->last_request_duration_ms = ast_tvdiff_ms(ast_tvnow(), pvt->request_start);
 	ao2_unlock(pvt);
 	write_end_of_recognition_call_event(pvt);
@@ -1105,9 +1108,9 @@ static int write_audio_frame(struct gdf_pvt *pvt, void *data, int len)
 		if (orig_vad_state == VAD_STATE_START) {
 			if (state == DF_STATE_READY && !start_recognition_on_start) {
 				if (df_start_recognition(pvt->session, pvt->language, 0, (const char **)pvt->hints, pvt->hint_count)) {
-					ast_log(LOG_WARNING, "Error starting recognition on %s\n", pvt->session_id);
-					gdf_stop_recognition(pvt);
 					state = df_get_state(pvt->session);
+					ast_log(LOG_WARNING, "Error starting recognition on %s (state is %d)\n", pvt->session_id, state);
+					gdf_stop_recognition(pvt);
 				}
 				ao2_lock(pvt);
 				pvt->last_audio_duration_ms = 0;
@@ -1151,7 +1154,6 @@ static int write_audio_frame(struct gdf_pvt *pvt, void *data, int len)
 		ao2_unlock(pvt);
 	}
 	if (state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
-		df_stop_recognition(pvt->session);
 		gdf_stop_recognition(pvt);
 	}
 
@@ -1233,12 +1235,8 @@ static int start_dialogflow_recognition(struct gdf_pvt *pvt)
 			pvt->state = GDFE_STATE_HAVE_RESULTS;
 			ao2_unlock(pvt);
 		} else {
-			ao2_lock(pvt);
-			if (pvt->speech) {
 				gdf_stop_recognition(pvt);
 			}
-			ao2_unlock(pvt);
-		}
 	} else {
 		df_connect(pvt->session);
 		ao2_lock(pvt);
@@ -1281,7 +1279,6 @@ static void *gdf_exec(void *arg)
 				ao2_unlock(pvt);
 				gdf_log_call_event_only(pvt, CALL_LOG_TYPE_RECOGNITION, "cancelled");
 
-				df_stop_recognition(pvt->session);
 				gdf_stop_recognition(pvt);
 				ao2_lock(pvt);
 		}
@@ -1297,7 +1294,7 @@ static void *gdf_exec(void *arg)
 		}
 	}
 	if (pvt->speech && pvt->speech->state == AST_SPEECH_STATE_READY) {
-		df_stop_recognition(pvt->session);
+		gdf_stop_recognition(pvt);
 	}
 
 	if (!ast_strlen_zero(pvt->lastAudioResponse)) {
