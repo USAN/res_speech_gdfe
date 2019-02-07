@@ -22,7 +22,7 @@
 	<depend>dfegrpc</depend>
  ***/
 
-#define REF_DEBUG 1
+//#define REF_DEBUG 1
 
 #include <asterisk.h>
 #include <asterisk/module.h>
