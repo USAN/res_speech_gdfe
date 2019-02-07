@@ -2122,7 +2122,6 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 	RAII_VAR(struct ast_json *, log_message, ast_json_object_create(), ast_json_unref);
 #else
 	json_t *log_message;
-	json_t *json_now;
 #endif
 
 	if (!call_log_enabled_for_pvt(pvt)) {
