@@ -2189,6 +2189,7 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 
 	ao2_lock(pvt);
 	fprintf(pvt->call_log_file_handle, "%s\n", log_line);
+	fflush(pvt->call_log_file_handle);
 	ao2_unlock(pvt);
 
 #ifdef ASTERISK_13_OR_LATER
