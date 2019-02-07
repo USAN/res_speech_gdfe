@@ -793,7 +793,7 @@ static int gdf_stop_recognition(struct gdf_pvt *pvt)
 		ast_speech_change_state(pvt->speech, AST_SPEECH_STATE_DONE); /* okay to call this locked */
 	}
 	if (pvt->state != GDFE_STATE_DONE) {
-	pvt->state = GDFE_STATE_HAVE_RESULTS;
+		pvt->state = GDFE_STATE_HAVE_RESULTS;
 	}
 	pvt->last_request_duration_ms = ast_tvdiff_ms(ast_tvnow(), pvt->request_start);
 	ao2_unlock(pvt);
@@ -1235,8 +1235,8 @@ static int start_dialogflow_recognition(struct gdf_pvt *pvt)
 			pvt->state = GDFE_STATE_HAVE_RESULTS;
 			ao2_unlock(pvt);
 		} else {
-				gdf_stop_recognition(pvt);
-			}
+			gdf_stop_recognition(pvt);
+		}
 	} else {
 		df_connect(pvt->session);
 		ao2_lock(pvt);
@@ -2122,6 +2122,7 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 	RAII_VAR(struct ast_json *, log_message, ast_json_object_create(), ast_json_unref);
 #else
 	json_t *log_message;
+	json_t *json_now;
 #endif
 
 	if (!call_log_enabled_for_pvt(pvt)) {
@@ -2244,10 +2245,21 @@ static struct ast_speech_engine gdf_engine = {
 	.state_changed = gdf_state_changed
 };
 
+static void *json_custom_malloc(size_t sz)
+{
+	return ast_malloc(sz);
+}
+static void json_custom_free(void *ptr)
+{
+	ast_free(ptr);
+}
+
 #pragma GCC diagnostic ignored "-Wmissing-format-attribute"
 static enum ast_module_load_result load_module(void)
 {
 	struct gdf_config *cfg;
+
+	json_set_alloc_funcs(json_custom_malloc, json_custom_free);
 
 	config = ao2_container_alloc(1, NULL, NULL);
 	if (!config) {
