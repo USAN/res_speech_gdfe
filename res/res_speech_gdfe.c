@@ -101,11 +101,11 @@ enum GDFE_STATE {
 	GDFE_STATE_DONE
 };
 
+struct gdf_request;
+
 struct gdf_pvt {
 	struct ast_speech *speech;
-	struct dialogflow_session *session;
 	
-	enum VAD_STATE vad_state;
 	int vad_state_duration; /* ms */
 	int vad_change_duration; /* ms -- cumulative time of "not current state" audio */
 
@@ -117,11 +117,52 @@ struct gdf_pvt {
 	FILE *call_log_file_handle;
 
 	int utterance_counter;
+	struct gdf_request *current_request;
 
 	enum SENTIMENT_ANALYSIS_STATE effective_sentiment_analysis_state;
 	int request_sentiment_analysis;
 
 	int record_next_utterance;
+
+	struct timeval session_start; /* log only, no store duration */
+
+	char **hints;
+	size_t hint_count;
+
+	AST_DECLARE_STRING_FIELDS(
+		AST_STRING_FIELD(logical_agent_name);
+		AST_STRING_FIELD(project_id);
+		AST_STRING_FIELD(session_id);
+		AST_STRING_FIELD(service_key);
+		AST_STRING_FIELD(endpoint);
+		AST_STRING_FIELD(event);
+		AST_STRING_FIELD(language);
+
+		AST_STRING_FIELD(call_log_path);
+		AST_STRING_FIELD(call_log_file_basename);
+		AST_STRING_FIELD(call_logging_application_name);
+		AST_STRING_FIELD(call_logging_context);
+	);
+};
+
+struct gdf_request {
+	struct gdf_pvt *pvt;
+	struct dialogflow_session *session;
+	
+	int current_utterance_number;
+
+	enum VAD_STATE vad_state;
+	int vad_state_duration; /* ms */
+	int vad_change_duration; /* ms -- cumulative time of "not current state" audio */
+
+	int voice_threshold; /* 0 - (2^16 - 1) */
+	int voice_minimum_duration; /* ms */
+	int silence_minimum_duration; /* ms */
+
+	enum SENTIMENT_ANALYSIS_STATE effective_sentiment_analysis_state;
+	int request_sentiment_analysis;
+
+	int record_utterance;
 
 	int utterance_preendpointer_recording_open_already_attempted;
 	FILE *utterance_preendpointer_recording_file_handle;
@@ -155,11 +196,6 @@ struct gdf_pvt {
 		AST_STRING_FIELD(event);
 		AST_STRING_FIELD(language);
 		AST_STRING_FIELD(lastAudioResponse);
-
-		AST_STRING_FIELD(call_log_path);
-		AST_STRING_FIELD(call_log_file_basename);
-		AST_STRING_FIELD(call_logging_application_name);
-		AST_STRING_FIELD(call_logging_context);
 	);
 };
 
@@ -221,16 +257,12 @@ typedef struct ast_format *local_ast_format_t;
 typedef int local_ast_format_t;
 #endif
 
-static void gdf_pvt_destructor(void *obj)
+static void gdf_request_destructor(void *obj)
 {
-	struct gdf_pvt *pvt = obj;
+	struct gdf_request *req = obj;
 	struct ast_frame *f;
 
-	ast_log(LOG_DEBUG, "Destroying gdf pvt %s\n", pvt->session_id);
-
-	if (pvt->call_log_file_handle != NULL) {
-		fclose(pvt->call_log_file_handle);
-	}
+	ast_log(LOG_DEBUG, "Destroying gdf request %d@%s\n", req->current_utterance_number, req->pvt->session_id);
 
 	if (pvt->mulaw_endpointer_audio_cache) {
 		ast_free(pvt->mulaw_endpointer_audio_cache);
@@ -246,6 +278,30 @@ static void gdf_pvt_destructor(void *obj)
 
 	while ((f = AST_LIST_REMOVE_HEAD(&pvt->frame_queue, frame_list))) {
 		ast_frfree(f);
+	}
+
+	ast_string_field_free_memory(pvt);
+
+	ao2_t_ref(req->pvt, -1, "Destroying request");
+}
+
+static void gdf_pvt_destructor(void *obj)
+{
+	struct gdf_pvt *pvt = obj;
+	struct ast_frame *f;
+
+	ast_log(LOG_DEBUG, "Destroying gdf pvt %s\n", pvt->session_id);
+
+	if (pvt->call_log_file_handle != NULL) {
+		fclose(pvt->call_log_file_handle);
+	}
+
+	if (pvt->hints) {
+		size_t i;
+		for (i = 0; i < pvt->hint_count; i++) {
+			ast_free(pvt->hints[i]);
+		}
+		ast_free(pvt->hints);
 	}
 
 	ast_string_field_free_memory(pvt);
