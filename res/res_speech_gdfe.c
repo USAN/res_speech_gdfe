@@ -1028,9 +1028,13 @@ static void start_call_log(struct gdf_pvt *pvt)
 
 		log_file = fopen(ast_str_buffer(path), "w");
 		if (log_file) {
+			char hostname[HOST_NAME_MAX] = "";
 			struct dialogflow_log_data log_data[] = {
-				{ "application", pvt->call_logging_application_name }
+				{ "application", pvt->call_logging_application_name },
+				{ "hostname", hostname }
 			};
+
+			gethostname(hostname, sizeof(hostname) - 1);
 
 			ast_log(LOG_DEBUG, "Opened %s for call log for %s\n", ast_str_buffer(path), pvt->session_id);
 			ao2_lock(pvt);
