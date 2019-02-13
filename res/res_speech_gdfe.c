@@ -94,18 +94,17 @@ enum SENTIMENT_ANALYSIS_STATE {
 };
 
 enum GDFE_STATE {
-	GDFE_STATE_IDLE,
 	GDFE_STATE_START,
 	GDFE_STATE_PROCESSING,
 	GDFE_STATE_HAVE_RESULTS,
 	GDFE_STATE_DONE
 };
 
+struct gdf_request;
+
 struct gdf_pvt {
 	struct ast_speech *speech;
-	struct dialogflow_session *session;
 	
-	enum VAD_STATE vad_state;
 	int vad_state_duration; /* ms */
 	int vad_change_duration; /* ms -- cumulative time of "not current state" audio */
 
@@ -117,11 +116,50 @@ struct gdf_pvt {
 	FILE *call_log_file_handle;
 
 	int utterance_counter;
+	struct gdf_request *current_request;
 
 	enum SENTIMENT_ANALYSIS_STATE effective_sentiment_analysis_state;
 	int request_sentiment_analysis;
 
 	int record_next_utterance;
+
+	struct timeval session_start; /* log only, no store duration */
+
+	char **hints;
+	size_t hint_count;
+
+	AST_DECLARE_STRING_FIELDS(
+		AST_STRING_FIELD(logical_agent_name);
+		AST_STRING_FIELD(project_id);
+		AST_STRING_FIELD(session_id);
+		AST_STRING_FIELD(service_key);
+		AST_STRING_FIELD(endpoint);
+		AST_STRING_FIELD(event);
+		AST_STRING_FIELD(language);
+		AST_STRING_FIELD(lastAudioResponse);
+
+		AST_STRING_FIELD(call_log_path);
+		AST_STRING_FIELD(call_log_file_basename);
+		AST_STRING_FIELD(call_logging_application_name);
+		AST_STRING_FIELD(call_logging_context);
+	);
+};
+
+struct gdf_request {
+	struct gdf_pvt *pvt;
+	struct dialogflow_session *session;
+	
+	int current_utterance_number;
+
+	enum VAD_STATE vad_state;
+	int vad_state_duration; /* ms */
+	int vad_change_duration; /* ms -- cumulative time of "not current state" audio */
+
+	int voice_threshold; /* 0 - (2^16 - 1) */
+	int voice_minimum_duration; /* ms */
+	int silence_minimum_duration; /* ms */
+
+	int record_utterance;
 
 	int utterance_preendpointer_recording_open_already_attempted;
 	FILE *utterance_preendpointer_recording_file_handle;
@@ -138,28 +176,17 @@ struct gdf_pvt {
 	long long last_request_duration_ms;
 	long long last_audio_duration_ms; /* calculated by packet, not clock */
 
-	char **hints;
-	size_t hint_count;
-
 	pthread_t thread;
 	enum GDFE_STATE state;
 	AST_LIST_HEAD_NOLOCK(, ast_frame) frame_queue;
 	int frame_queue_len;
 
 	AST_DECLARE_STRING_FIELDS(
-		AST_STRING_FIELD(logical_agent_name);
 		AST_STRING_FIELD(project_id);
-		AST_STRING_FIELD(session_id);
 		AST_STRING_FIELD(service_key);
 		AST_STRING_FIELD(endpoint);
 		AST_STRING_FIELD(event);
 		AST_STRING_FIELD(language);
-		AST_STRING_FIELD(lastAudioResponse);
-
-		AST_STRING_FIELD(call_log_path);
-		AST_STRING_FIELD(call_log_file_basename);
-		AST_STRING_FIELD(call_logging_application_name);
-		AST_STRING_FIELD(call_logging_context);
 	);
 };
 
@@ -208,10 +235,10 @@ enum gdf_call_log_type {
 
 static struct gdf_config *gdf_get_config(void);
 static struct gdf_logical_agent *get_logical_agent_by_name(struct gdf_config *config, const char *name);
-static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type, const char *event, size_t log_data_size, const struct dialogflow_log_data *log_data);
-#define gdf_log_call_event_only(pvt, type, event)       gdf_log_call_event(pvt, type, event, 0, NULL)
+static void gdf_log_call_event(struct gdf_pvt *pvt, struct gdf_request *req, enum gdf_call_log_type type, const char *event, size_t log_data_size, const struct dialogflow_log_data *log_data);
+#define gdf_log_call_event_only(pvt, req, type, event)       gdf_log_call_event(pvt, req, type, event, 0, NULL)
 
-static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf_pvt *pvt, int include_utterance_counter, const char *type, const char *extension);
+static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf_pvt *pvt, struct gdf_request *req, const char *type, const char *extension);
 
 static void *gdf_exec(void *arg);
 
@@ -221,19 +248,40 @@ typedef struct ast_format *local_ast_format_t;
 typedef int local_ast_format_t;
 #endif
 
+static void gdf_request_destructor(void *obj)
+{
+	struct gdf_request *req = obj;
+	struct ast_frame *f;
+
+	ast_log(LOG_DEBUG, "Destroying gdf request %d@%s\n", req->current_utterance_number, req->pvt->session_id);
+
+	df_close_session(req->session);
+
+	if (req->mulaw_endpointer_audio_cache) {
+		ast_free(req->mulaw_endpointer_audio_cache);
+		req->mulaw_endpointer_audio_cache = NULL;
+	}
+
+	while ((f = AST_LIST_REMOVE_HEAD(&req->frame_queue, frame_list))) {
+		ast_frfree(f);
+	}
+
+	ast_string_field_free_memory(req);
+
+	if (req->pvt) {
+		ao2_t_ref(req->pvt, -1, "Destroying request");
+		req->pvt = NULL;
+	}
+}
+
 static void gdf_pvt_destructor(void *obj)
 {
 	struct gdf_pvt *pvt = obj;
-	struct ast_frame *f;
 
 	ast_log(LOG_DEBUG, "Destroying gdf pvt %s\n", pvt->session_id);
 
 	if (pvt->call_log_file_handle != NULL) {
 		fclose(pvt->call_log_file_handle);
-	}
-
-	if (pvt->mulaw_endpointer_audio_cache) {
-		ast_free(pvt->mulaw_endpointer_audio_cache);
 	}
 
 	if (pvt->hints) {
@@ -244,8 +292,9 @@ static void gdf_pvt_destructor(void *obj)
 		ast_free(pvt->hints);
 	}
 
-	while ((f = AST_LIST_REMOVE_HEAD(&pvt->frame_queue, frame_list))) {
-		ast_frfree(f);
+	if (!ast_strlen_zero(pvt->lastAudioResponse)) {
+		unlink(pvt->lastAudioResponse);
+		ast_string_field_set(pvt, lastAudioResponse, "");
 	}
 
 	ast_string_field_free_memory(pvt);
@@ -258,7 +307,6 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	char session_id[32];
 	size_t sidlen = sizeof(session_id);
 	char *sid = session_id;
-	int res;
 
 	pvt = ao2_alloc(sizeof(struct gdf_pvt), gdf_pvt_destructor);
 	if (!pvt) {
@@ -276,20 +324,6 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 
 	cfg = gdf_get_config();
 
-	ao2_t_ref(pvt, 1, "Passing ref to dialogflow driver");
-	pvt->session = df_create_session(pvt);
-	df_set_auth_key(pvt->session, cfg->service_key);
-	df_set_endpoint(pvt->session, cfg->endpoint);
-
-	if (!pvt->session) {
-		ast_log(LOG_WARNING, "Error creating session for GDF\n");
-		ao2_t_ref(cfg, -1, "done with creating session");
-		ao2_t_ref(pvt, -1, "Error creating dialogflow session");
-		return -1;
-	}
-
-	/* temporarily set _something_ */
-	df_set_session_id(pvt->session, session_id);
 	ast_string_field_set(pvt, session_id, session_id);
 	pvt->voice_threshold = cfg->vad_voice_threshold;
 	pvt->voice_minimum_duration = cfg->vad_voice_minimum_duration;
@@ -297,16 +331,6 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	pvt->session_start = ast_tvnow();
 	ast_string_field_set(pvt, call_logging_application_name, "unknown");
 	pvt->speech = speech;
-
-	if (pvt->voice_minimum_duration || cfg->endpointer_cache_audio_pretrigger_ms) {
-		size_t cache_needed_size = (pvt->voice_minimum_duration + cfg->endpointer_cache_audio_pretrigger_ms) * 8; /* bytes per millisecond */
-		pvt->mulaw_endpointer_audio_cache = ast_calloc(1, cache_needed_size);
-		if (pvt->mulaw_endpointer_audio_cache) {
-			pvt->mulaw_endpointer_audio_cache_size = cache_needed_size;
-			pvt->mulaw_endpointer_audio_cache_start = 0;
-			pvt->mulaw_endpointer_audio_cache_len = 0;
-		}
-	}
 
 	ast_log(LOG_DEBUG, "Creating GDF session %s\n", pvt->session_id);
 
@@ -316,20 +340,81 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	/* speech will borrow this reference */
 	ast_mutex_unlock(&speech->lock);
 
-	ao2_t_ref(pvt, 1, "Bump ref for background thread");
-	res = ast_pthread_create_detached(&pvt->thread, NULL, gdf_exec, pvt);
-	if (res) {
-		ast_log(LOG_WARNING, "Unable to create background thread for GDF");
-		ao2_t_ref(pvt, -1, "Clearing speech borrowed reference");
-		speech->data = NULL;
-		ao2_t_ref(cfg, -1, "done with creating session");
-		ao2_t_ref(pvt, -1, "Error creating background thread");
-		return -1;
-	}
-
 	ao2_t_ref(cfg, -1, "done with creating session");
 
 	return 0;
+}
+
+static struct gdf_request *create_new_request(struct gdf_pvt *pvt, int utterance_number)
+{
+	struct gdf_request *req;
+	struct gdf_config *cfg;
+	int res;
+
+	req = ao2_alloc(sizeof(struct gdf_request), gdf_request_destructor);
+	if (!pvt) {
+		ast_log(LOG_WARNING, "Error allocating memory for GDF request structure\n");
+		return NULL;
+	}
+
+	if (ast_string_field_init(req, 252)) {
+		ast_log(LOG_WARNING, "Error allocating GDF request string fields\n");
+		ao2_t_ref(req, -1, "Error allocating string fields");
+		return NULL;
+	}
+
+	ao2_t_ref(pvt, 1, "Adding backpointer from request to private");
+	req->pvt = pvt;
+	req->current_utterance_number = utterance_number;
+
+	cfg = gdf_get_config();
+
+	req->session = df_create_session(req);
+	if (!req->session) {
+		ast_log(LOG_WARNING, "Error creating session for GDF\n");
+		ao2_t_ref(cfg, -1, "done with creating request");
+		ao2_t_ref(req, -1, "Error creating dialogflow request");
+		return NULL;
+	}
+	df_set_auth_key(req->session, pvt->service_key);
+	df_set_endpoint(req->session, pvt->endpoint);
+	df_set_session_id(req->session, pvt->session_id);
+
+	ast_string_field_set(req, project_id, pvt->project_id);
+	ast_string_field_set(req, event, pvt->event);
+	ast_string_field_set(req, language, pvt->language);
+	ast_string_field_set(req, service_key, pvt->service_key);
+	ast_string_field_set(req, endpoint, pvt->endpoint);
+
+	req->voice_threshold = pvt->voice_threshold;
+	req->voice_minimum_duration = pvt->voice_minimum_duration;
+	req->silence_minimum_duration = pvt->silence_minimum_duration;
+	req->session_start = ast_tvnow();
+
+	if (req->voice_minimum_duration || cfg->endpointer_cache_audio_pretrigger_ms) {
+		size_t cache_needed_size = (req->voice_minimum_duration + cfg->endpointer_cache_audio_pretrigger_ms) * 8; /* bytes per millisecond */
+		req->mulaw_endpointer_audio_cache = ast_calloc(1, cache_needed_size);
+		if (req->mulaw_endpointer_audio_cache) {
+			req->mulaw_endpointer_audio_cache_size = cache_needed_size;
+			req->mulaw_endpointer_audio_cache_start = 0;
+			req->mulaw_endpointer_audio_cache_len = 0;
+		}
+	}
+
+	ast_log(LOG_DEBUG, "Creating GDF request %d@%s\n", req->current_utterance_number, pvt->session_id);
+
+	ao2_t_ref(req, 1, "Bump ref for background thread");
+	res = ast_pthread_create_detached(&req->thread, NULL, gdf_exec, req);
+	if (res) {
+		ast_log(LOG_WARNING, "Unable to create background thread for GDF");
+		ao2_t_ref(cfg, -1, "done with creating request");
+		ao2_t_ref(req, -1, "Error creating background thread");
+		return NULL;
+	}
+
+	ao2_t_ref(cfg, -1, "done with creating request");
+
+	return req;
 }
 
 static void log_session_end(struct gdf_pvt *pvt, long long duration_ms)
@@ -343,7 +428,7 @@ static void log_session_end(struct gdf_pvt *pvt, long long duration_ms)
 
 	ast_build_string(&buff, &buffLen, "%lld", duration_ms);
 
-	gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "end", ARRAY_LEN(log_data), log_data);
+	gdf_log_call_event(pvt, NULL, CALL_LOG_TYPE_SESSION, "end", ARRAY_LEN(log_data), log_data);
 }
 
 static int gdf_destroy(struct ast_speech *speech)
@@ -351,8 +436,11 @@ static int gdf_destroy(struct ast_speech *speech)
 	struct gdf_pvt *pvt = speech->data;
 
 	ao2_lock(pvt);
-	pvt->state = GDFE_STATE_DONE;
 	pvt->speech = NULL;
+	if (pvt->current_request) {
+		ao2_t_ref(pvt->current_request, -1, "Destroying session, releasing request");
+	}
+	pvt->current_request = NULL;
 	ao2_unlock(pvt);
 	
 	log_session_end(pvt, ast_tvdiff_ms(ast_tvnow(), pvt->session_start));
@@ -541,7 +629,7 @@ static int calculate_audio_level(const short *slin, int len)
 	return sum / len;
 }
 
-static void write_end_of_recognition_call_event(struct gdf_pvt *pvt)
+static void write_end_of_recognition_call_event(struct gdf_request *req)
 {
 	char duration_buffer[21] = "";
 	char utterance_duration_buffer[21] = "";
@@ -550,104 +638,104 @@ static void write_end_of_recognition_call_event(struct gdf_pvt *pvt)
 		{ "utterance_duration_ms", utterance_duration_buffer }
 	};
 
-	sprintf(duration_buffer, "%lld", pvt->last_request_duration_ms);
-	sprintf(utterance_duration_buffer, "%lld", pvt->last_audio_duration_ms);
+	sprintf(duration_buffer, "%lld", req->last_request_duration_ms);
+	sprintf(utterance_duration_buffer, "%lld", req->last_audio_duration_ms);
 
-	gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "stop", ARRAY_LEN(log_data), log_data);
+	gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_RECOGNITION, "stop", ARRAY_LEN(log_data), log_data);
 }
 
-static int open_preendpointed_recording_file(struct gdf_pvt *pvt)
+static int open_preendpointed_recording_file(struct gdf_request *req)
 {
-	struct ast_str *path = build_log_related_filename_to_thread_local_str(pvt, 1, "pre", "ul");
+	struct ast_str *path = build_log_related_filename_to_thread_local_str(req->pvt, req, "pre", "ul");
 	FILE *record_file;
 
-	ao2_lock(pvt);
-	pvt->utterance_preendpointer_recording_open_already_attempted = 1;
-	ao2_unlock(pvt);
+	ao2_lock(req);
+	req->utterance_preendpointer_recording_open_already_attempted = 1;
+	ao2_unlock(req);
 
 	record_file = fopen(ast_str_buffer(path), "w");
 	if (record_file) {
 		struct dialogflow_log_data log_data[] = {
 			{ "filename", ast_str_buffer(path) }
 		};
-		gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "pre_recording_start", ARRAY_LEN(log_data), log_data);
-		ast_log(LOG_DEBUG, "Opened %s for preendpointer recording for %s\n", ast_str_buffer(path), pvt->session_id);
-		ao2_lock(pvt);
-		pvt->utterance_preendpointer_recording_file_handle = record_file;
-		ao2_unlock(pvt);
+		gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "pre_recording_start", ARRAY_LEN(log_data), log_data);
+		ast_log(LOG_DEBUG, "Opened %s for preendpointer recording for %d@%s\n", ast_str_buffer(path), req->current_utterance_number, req->pvt->session_id);
+		ao2_lock(req);
+		req->utterance_preendpointer_recording_file_handle = record_file;
+		ao2_unlock(req);
 	} else {
-		ast_log(LOG_WARNING, "Unable to open %s for preendpointer recording for %s -- %d: %s\n", ast_str_buffer(path), pvt->session_id, errno, strerror(errno));
+		ast_log(LOG_WARNING, "Unable to open %s for preendpointer recording for %d@%s -- %d: %s\n", ast_str_buffer(path), req->current_utterance_number, req->pvt->session_id, errno, strerror(errno));
 	}
 
 	return (record_file == NULL ? -1 : 0);
 }
 
-static int open_postendpointed_recording_file(struct gdf_pvt *pvt)
+static int open_postendpointed_recording_file(struct gdf_request *req)
 {
-	struct ast_str *path = build_log_related_filename_to_thread_local_str(pvt, 1, "post", "ul");
+	struct ast_str *path = build_log_related_filename_to_thread_local_str(req->pvt, req, "post", "ul");
 	FILE *record_file;
 
-	ao2_lock(pvt);
-	pvt->utterance_postendpointer_recording_open_already_attempted = 1;
-	ao2_unlock(pvt);
+	ao2_lock(req);
+	req->utterance_postendpointer_recording_open_already_attempted = 1;
+	ao2_unlock(req);
 
 	record_file = fopen(ast_str_buffer(path), "w");
 	if (record_file) {
 		struct dialogflow_log_data log_data[] = {
 			{ "filename", ast_str_buffer(path) }
 		};
-		gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "post_recording_start", ARRAY_LEN(log_data), log_data);
-		ast_log(LOG_DEBUG, "Opened %s for postendpointer recording for %s\n", ast_str_buffer(path), pvt->session_id);
-		ao2_lock(pvt);
-		pvt->utterance_postendpointer_recording_file_handle = record_file;
-		ao2_unlock(pvt);
+		gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "post_recording_start", ARRAY_LEN(log_data), log_data);
+		ast_log(LOG_DEBUG, "Opened %s for postendpointer recording for %d@%s\n", ast_str_buffer(path), req->current_utterance_number, req->pvt->session_id);
+		ao2_lock(req);
+		req->utterance_postendpointer_recording_file_handle = record_file;
+		ao2_unlock(req);
 	} else {
-		ast_log(LOG_WARNING, "Unable to open %s for postendpointer recording for %s -- %d: %s\n", ast_str_buffer(path), pvt->session_id, errno, strerror(errno));
+		ast_log(LOG_WARNING, "Unable to open %s for postendpointer recording for %d@%s -- %d: %s\n", ast_str_buffer(path), req->current_utterance_number, req->pvt->session_id, errno, strerror(errno));
 	}
 
 	return (record_file == NULL ? -1 : 0);
 }
 
-static void coalesce_cached_audio_for_writing(struct gdf_pvt *pvt)
+static void coalesce_cached_audio_for_writing(struct gdf_request *req)
 {
-	ao2_lock(pvt);
-	if (pvt->mulaw_endpointer_audio_cache) {
+	ao2_lock(req);
+	if (req->mulaw_endpointer_audio_cache) {
 		size_t end_amount_at_beginning_of_buffer;
 		
-		if (pvt->mulaw_endpointer_audio_cache_start == 0) {
+		if (req->mulaw_endpointer_audio_cache_start == 0) {
 			end_amount_at_beginning_of_buffer = 0;
-		} else if (pvt->mulaw_endpointer_audio_cache_start + pvt->mulaw_endpointer_audio_cache_len > pvt->mulaw_endpointer_audio_cache_size) {
-			end_amount_at_beginning_of_buffer = (pvt->mulaw_endpointer_audio_cache_start + pvt->mulaw_endpointer_audio_cache_len) - pvt->mulaw_endpointer_audio_cache_size;
+		} else if (req->mulaw_endpointer_audio_cache_start + req->mulaw_endpointer_audio_cache_len > req->mulaw_endpointer_audio_cache_size) {
+			end_amount_at_beginning_of_buffer = (req->mulaw_endpointer_audio_cache_start + req->mulaw_endpointer_audio_cache_len) - req->mulaw_endpointer_audio_cache_size;
 		} else {
-			ast_log(LOG_DEBUG, "Audio cache buffer for %s not a full buffer but starts in middle\n", pvt->session_id);
+			ast_log(LOG_DEBUG, "Audio cache buffer for %d@%s not a full buffer but starts in middle\n", req->current_utterance_number, req->pvt->session_id);
 			end_amount_at_beginning_of_buffer = 0;
 		}
 
 		if (end_amount_at_beginning_of_buffer == 0) {
-			if (pvt->mulaw_endpointer_audio_cache_start == 0) {
+			if (req->mulaw_endpointer_audio_cache_start == 0) {
 				/* nothing to do */
 			} else {
-				char *start_of_cached_audio = pvt->mulaw_endpointer_audio_cache + pvt->mulaw_endpointer_audio_cache_start;
-				memmove(pvt->mulaw_endpointer_audio_cache, start_of_cached_audio, pvt->mulaw_endpointer_audio_cache_len);
-				pvt->mulaw_endpointer_audio_cache_start = 0;
+				char *start_of_cached_audio = req->mulaw_endpointer_audio_cache + req->mulaw_endpointer_audio_cache_start;
+				memmove(req->mulaw_endpointer_audio_cache, start_of_cached_audio, req->mulaw_endpointer_audio_cache_len);
+				req->mulaw_endpointer_audio_cache_start = 0;
 			}
 		} else {
 			char *cache = alloca(end_amount_at_beginning_of_buffer);
-			char *start_of_cached_audio = pvt->mulaw_endpointer_audio_cache + pvt->mulaw_endpointer_audio_cache_start;
-			size_t amount_of_audio_at_end_of_buffer = pvt->mulaw_endpointer_audio_cache_size - pvt->mulaw_endpointer_audio_cache_start;
-			char *where_end_of_audio_will_go = pvt->mulaw_endpointer_audio_cache + amount_of_audio_at_end_of_buffer;
+			char *start_of_cached_audio = req->mulaw_endpointer_audio_cache + req->mulaw_endpointer_audio_cache_start;
+			size_t amount_of_audio_at_end_of_buffer = req->mulaw_endpointer_audio_cache_size - req->mulaw_endpointer_audio_cache_start;
+			char *where_end_of_audio_will_go = req->mulaw_endpointer_audio_cache + amount_of_audio_at_end_of_buffer;
 
-			memcpy(cache, pvt->mulaw_endpointer_audio_cache, end_amount_at_beginning_of_buffer);
-			memmove(pvt->mulaw_endpointer_audio_cache, start_of_cached_audio, amount_of_audio_at_end_of_buffer);
+			memcpy(cache, req->mulaw_endpointer_audio_cache, end_amount_at_beginning_of_buffer);
+			memmove(req->mulaw_endpointer_audio_cache, start_of_cached_audio, amount_of_audio_at_end_of_buffer);
 			memcpy(where_end_of_audio_will_go, cache, end_amount_at_beginning_of_buffer);
 
-			pvt->mulaw_endpointer_audio_cache_start = 0;
+			req->mulaw_endpointer_audio_cache_start = 0;
 		}
 	}
-	ao2_unlock(pvt);
+	ao2_unlock(req);
 }
 
-static void maybe_record_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mulaw_len, enum VAD_STATE current_vad_state)
+static void maybe_record_audio(struct gdf_request *req, const char *mulaw, size_t mulaw_len, enum VAD_STATE current_vad_state)
 {
 	struct gdf_config *config = gdf_get_config();
 	int enable_preendpointer_recordings = 0;
@@ -665,38 +753,35 @@ static void maybe_record_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mu
 		ao2_t_ref(config, -1, "done with config checking for recording");
 	}
 
-	ao2_lock(pvt);
-	enable_postendpointer_recordings |= pvt->record_next_utterance;
+	enable_postendpointer_recordings |= req->record_utterance;
 	if (record_preendpointer_on_demand) {
-		enable_preendpointer_recordings |= pvt->record_next_utterance;
+		enable_preendpointer_recordings |= req->record_utterance;
 	}
-	pvt->record_next_utterance = 0;
-	ao2_unlock(pvt);
-
+	
 	if (enable_postendpointer_recordings || enable_preendpointer_recordings) {
 		int have_call_log_path;
-		ao2_lock(pvt);
-		have_call_log_path = !ast_strlen_zero(pvt->call_log_path);
+		ao2_lock(req);
+		have_call_log_path = !ast_strlen_zero(req->pvt->call_log_path);
 		if (have_call_log_path) {
-			currently_recording_preendpointed_audio = (pvt->utterance_preendpointer_recording_file_handle != NULL);
-			already_attempted_open_for_preendpointed_audio = pvt->utterance_preendpointer_recording_open_already_attempted;
-			currently_recording_postendpointed_audio = (pvt->utterance_postendpointer_recording_file_handle != NULL);
-			already_attempted_open_for_postendpointed_audio = pvt->utterance_postendpointer_recording_open_already_attempted;
+			currently_recording_preendpointed_audio = (req->utterance_preendpointer_recording_file_handle != NULL);
+			already_attempted_open_for_preendpointed_audio = req->utterance_preendpointer_recording_open_already_attempted;
+			currently_recording_postendpointed_audio = (req->utterance_postendpointer_recording_file_handle != NULL);
+			already_attempted_open_for_postendpointed_audio = req->utterance_postendpointer_recording_open_already_attempted;
 		}
-		ao2_unlock(pvt);
+		ao2_unlock(req);
 	}
 
 	if (enable_preendpointer_recordings) {
 		if (!currently_recording_preendpointed_audio && !already_attempted_open_for_preendpointed_audio) {
-			if (!open_preendpointed_recording_file(pvt)) {
+			if (!open_preendpointed_recording_file(req)) {
 				currently_recording_preendpointed_audio = 1;
 			}
 		}
 		if (currently_recording_preendpointed_audio) {
-			size_t written = fwrite(mulaw, sizeof(char), mulaw_len, pvt->utterance_preendpointer_recording_file_handle);
+			size_t written = fwrite(mulaw, sizeof(char), mulaw_len, req->utterance_preendpointer_recording_file_handle);
 			if (written < mulaw_len) {
-				ast_log(LOG_WARNING, "Only wrote %d of %d bytes for pre-endpointed recording for %s\n",
-					(int) written, (int) mulaw_len, pvt->session_id);
+				ast_log(LOG_WARNING, "Only wrote %d of %d bytes for pre-endpointed recording for%d@%s\n",
+					(int) written, (int) mulaw_len, req->current_utterance_number, req->pvt->session_id);
 			}
 		}
 	}
@@ -704,100 +789,95 @@ static void maybe_record_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mu
 	if (enable_postendpointer_recordings && current_vad_state != VAD_STATE_START) {
 		int need_to_dump_cached_audio = 0;
 		if (!currently_recording_postendpointed_audio && !already_attempted_open_for_postendpointed_audio) {
-			if (!open_postendpointed_recording_file(pvt)) {
+			if (!open_postendpointed_recording_file(req)) {
 				currently_recording_postendpointed_audio = 1;
 				need_to_dump_cached_audio = 1;
 			}
 		}
 		if (need_to_dump_cached_audio) {
 			size_t written;
-			coalesce_cached_audio_for_writing(pvt);
-			written = fwrite(pvt->mulaw_endpointer_audio_cache, sizeof(char), pvt->mulaw_endpointer_audio_cache_len, pvt->utterance_postendpointer_recording_file_handle);
-			if (written < pvt->mulaw_endpointer_audio_cache_len) {
-				ast_log(LOG_WARNING, "Only wrote %d of %d bytes for cached post-endpointed recording for %s\n",
-					(int) written, (int) pvt->mulaw_endpointer_audio_cache_len, pvt->session_id);
+			coalesce_cached_audio_for_writing(req);
+			written = fwrite(req->mulaw_endpointer_audio_cache, sizeof(char), req->mulaw_endpointer_audio_cache_len, req->utterance_postendpointer_recording_file_handle);
+			if (written < req->mulaw_endpointer_audio_cache_len) {
+				ast_log(LOG_WARNING, "Only wrote %d of %d bytes for cached post-endpointed recording for %d@%s\n",
+					(int) written, (int) req->mulaw_endpointer_audio_cache_len, req->current_utterance_number, req->pvt->session_id);
 			}
 		}
 		if (currently_recording_postendpointed_audio) {
-			size_t written = fwrite(mulaw, sizeof(char), mulaw_len, pvt->utterance_postendpointer_recording_file_handle);
+			size_t written = fwrite(mulaw, sizeof(char), mulaw_len, req->utterance_postendpointer_recording_file_handle);
 			if (written < mulaw_len) {
-				ast_log(LOG_WARNING, "Only wrote %d of %d bytes for post-endpointed recording for %s\n",
-					(int) written, (int) mulaw_len, pvt->session_id);
+				ast_log(LOG_WARNING, "Only wrote %d of %d bytes for post-endpointed recording for %d@%s\n",
+					(int) written, (int) mulaw_len, req->current_utterance_number, req->pvt->session_id);
 			}
 		}
 	}
 }
 
-static void maybe_cache_preendpointed_audio(struct gdf_pvt *pvt, const char *mulaw, size_t mulaw_len, enum VAD_STATE vad_state)
+static void maybe_cache_preendpointed_audio(struct gdf_request *req, const char *mulaw, size_t mulaw_len, enum VAD_STATE vad_state)
 {
 	if (vad_state == VAD_STATE_START) {
-		ao2_lock(pvt);
-		if (pvt->mulaw_endpointer_audio_cache) {
+		ao2_lock(req);
+		if (req->mulaw_endpointer_audio_cache) {
 			size_t relative_write_location;
 			char *write_location;
 
-			if (pvt->mulaw_endpointer_audio_cache_len + mulaw_len > pvt->mulaw_endpointer_audio_cache_size) {
-				size_t space_needed = pvt->mulaw_endpointer_audio_cache_len + mulaw_len - pvt->mulaw_endpointer_audio_cache_size;
-				pvt->mulaw_endpointer_audio_cache_start += space_needed;
-				pvt->mulaw_endpointer_audio_cache_len -= space_needed;
-				if (pvt->mulaw_endpointer_audio_cache_start >= pvt->mulaw_endpointer_audio_cache_size) {
-					pvt->mulaw_endpointer_audio_cache_start -= pvt->mulaw_endpointer_audio_cache_size;
+			if (req->mulaw_endpointer_audio_cache_len + mulaw_len > req->mulaw_endpointer_audio_cache_size) {
+				size_t space_needed = req->mulaw_endpointer_audio_cache_len + mulaw_len - req->mulaw_endpointer_audio_cache_size;
+				req->mulaw_endpointer_audio_cache_start += space_needed;
+				req->mulaw_endpointer_audio_cache_len -= space_needed;
+				if (req->mulaw_endpointer_audio_cache_start >= req->mulaw_endpointer_audio_cache_size) {
+					req->mulaw_endpointer_audio_cache_start -= req->mulaw_endpointer_audio_cache_size;
 				}
 			}
 
-			relative_write_location = pvt->mulaw_endpointer_audio_cache_start + pvt->mulaw_endpointer_audio_cache_len;
-			if (relative_write_location >= pvt->mulaw_endpointer_audio_cache_size) {
-				relative_write_location -= pvt->mulaw_endpointer_audio_cache_size;
+			relative_write_location = req->mulaw_endpointer_audio_cache_start + req->mulaw_endpointer_audio_cache_len;
+			if (relative_write_location >= req->mulaw_endpointer_audio_cache_size) {
+				relative_write_location -= req->mulaw_endpointer_audio_cache_size;
 			}
 			
-			write_location = pvt->mulaw_endpointer_audio_cache + relative_write_location;
+			write_location = req->mulaw_endpointer_audio_cache + relative_write_location;
 
 			memcpy(write_location, mulaw, mulaw_len);
-			pvt->mulaw_endpointer_audio_cache_len += mulaw_len;
+			req->mulaw_endpointer_audio_cache_len += mulaw_len;
 		}
-		ao2_unlock(pvt);
+		ao2_unlock(req);
 	}
 }
 
-static void close_preendpointed_audio_recording(struct gdf_pvt *pvt)
+static void close_preendpointed_audio_recording(struct gdf_request *req)
 {
-	ao2_lock(pvt);
-	if (pvt->utterance_preendpointer_recording_file_handle) {
-		fclose(pvt->utterance_preendpointer_recording_file_handle);
-		pvt->utterance_preendpointer_recording_file_handle = NULL;
-		gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "pre_recording_stop");
+	if (req->utterance_preendpointer_recording_file_handle) {
+		fclose(req->utterance_preendpointer_recording_file_handle);
+		req->utterance_preendpointer_recording_file_handle = NULL;
+		gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "pre_recording_stop");
 	}
-	pvt->utterance_preendpointer_recording_open_already_attempted = 0;
-	ao2_unlock(pvt);
+	req->utterance_preendpointer_recording_open_already_attempted = 0;
 }
 
-static void close_postendpointed_audio_recording(struct gdf_pvt *pvt)
+static void close_postendpointed_audio_recording(struct gdf_request *req)
 {
-	ao2_lock(pvt);
-	if (pvt->utterance_postendpointer_recording_file_handle) {
-		fclose(pvt->utterance_postendpointer_recording_file_handle);
-		pvt->utterance_postendpointer_recording_file_handle = NULL;
-		gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "post_recording_stop");
+	if (req->utterance_postendpointer_recording_file_handle) {
+		fclose(req->utterance_postendpointer_recording_file_handle);
+		req->utterance_postendpointer_recording_file_handle = NULL;
+		gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "post_recording_stop");
 	}
-	pvt->utterance_postendpointer_recording_open_already_attempted = 0;
-	ao2_unlock(pvt);
+	req->utterance_postendpointer_recording_open_already_attempted = 0;
 }
 
-static int gdf_stop_recognition(struct gdf_pvt *pvt)
+static int gdf_stop_recognition(struct gdf_request *req)
 {
-	close_preendpointed_audio_recording(pvt);
-	close_postendpointed_audio_recording(pvt);
-	df_stop_recognition(pvt->session);
-	ao2_lock(pvt);
-	if (pvt->speech) {
-		ast_speech_change_state(pvt->speech, AST_SPEECH_STATE_DONE); /* okay to call this locked */
+	close_preendpointed_audio_recording(req);
+	close_postendpointed_audio_recording(req);
+	df_stop_recognition(req->session);
+	ao2_lock(req->pvt);
+	if (req == req->pvt->current_request) {
+		if (req->pvt->speech) {
+			ast_speech_change_state(req->pvt->speech, AST_SPEECH_STATE_DONE); /* okay to call this locked */
+		}
 	}
-	if (pvt->state != GDFE_STATE_DONE) {
-		pvt->state = GDFE_STATE_HAVE_RESULTS;
-	}
-	pvt->last_request_duration_ms = ast_tvdiff_ms(ast_tvnow(), pvt->request_start);
-	ao2_unlock(pvt);
-	write_end_of_recognition_call_event(pvt);
+	ao2_unlock(req->pvt);
+	req->last_request_duration_ms = ast_tvdiff_ms(ast_tvnow(), req->request_start);
+	write_end_of_recognition_call_event(req);
 	return 0;
 }
 
@@ -826,9 +906,11 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	iso = ast_frisolate(&f);
 	if (iso) {
 		ao2_lock(pvt);
-		if (pvt->state == GDFE_STATE_PROCESSING) {
-			AST_LIST_INSERT_TAIL(&pvt->frame_queue, iso, frame_list);
-			pvt->frame_queue_len++;
+		if (pvt->current_request) {
+			ao2_lock(pvt->current_request);
+			AST_LIST_INSERT_TAIL(&pvt->current_request->frame_queue, iso, frame_list);
+			pvt->current_request->frame_queue_len++;
+			ao2_unlock(pvt->current_request);
 		} else {
 			ast_frfree(iso);
 		}
@@ -907,7 +989,7 @@ static void mkdir_log_path(struct gdf_pvt *pvt)
 	ast_mkdir(pvt->call_log_path, 0755);
 }
 
-static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf_pvt *pvt, int include_utterance_counter, const char *type, const char *extension)
+static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf_pvt *pvt, struct gdf_request *req, const char *type, const char *extension)
 {
 	struct ast_str *path;
 	path = ast_str_thread_get(&call_log_path, 256);
@@ -915,8 +997,8 @@ static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf
 	ast_str_set(&path, 0, "%s", pvt->call_log_path);
 	ast_str_append(&path, 0, "%s", pvt->call_log_file_basename);
 	ast_str_append(&path, 0, "_%s", type);
-	if (include_utterance_counter) {
-		ast_str_append(&path, 0, "_%d", pvt->utterance_counter);
+	if (req) {
+		ast_str_append(&path, 0, "_%d", req->current_utterance_number);
 	}
 	ast_str_append(&path, 0, ".%s" , extension);
 	ao2_unlock(pvt);
@@ -926,6 +1008,10 @@ static struct ast_str *build_log_related_filename_to_thread_local_str(struct gdf
 static void start_call_log(struct gdf_pvt *pvt)
 {
 	ao2_lock(pvt);
+	if (pvt->call_log_open_already_attempted) {
+		ao2_unlock(pvt);
+		return;
+	}
 	pvt->call_log_open_already_attempted = 1;
 	ao2_unlock(pvt);
 
@@ -938,7 +1024,7 @@ static void start_call_log(struct gdf_pvt *pvt)
 
 		mkdir_log_path(pvt);
 
-		path = build_log_related_filename_to_thread_local_str(pvt, 0, "log", "jsonl");
+		path = build_log_related_filename_to_thread_local_str(pvt, NULL, "log", "jsonl");
 
 		log_file = fopen(ast_str_buffer(path), "w");
 		if (log_file) {
@@ -951,7 +1037,7 @@ static void start_call_log(struct gdf_pvt *pvt)
 			pvt->call_log_file_handle = log_file;
 			ao2_unlock(pvt);
 
-			gdf_log_call_event(pvt, CALL_LOG_TYPE_SESSION, "start", ARRAY_LEN(log_data), log_data);
+			gdf_log_call_event(pvt, NULL, CALL_LOG_TYPE_SESSION, "start", ARRAY_LEN(log_data), log_data);
 		} else {
 			ast_log(LOG_WARNING, "Unable to open %s for writing call log for %s -- %d: %s\n", ast_str_buffer(path), pvt->session_id, errno, strerror(errno));
 		}
@@ -960,13 +1046,10 @@ static void start_call_log(struct gdf_pvt *pvt)
 	}
 }
 
-static void log_endpointer_start_event(struct gdf_pvt *pvt)
+static void log_endpointer_start_event(struct gdf_request *req)
 {
-	int pvt_threshold;
 	char threshold[11];
-	int pvt_voice_duration;
 	char voice_duration[11];
-	int pvt_silence_duration;
 	char silence_duration[11];
 	struct dialogflow_log_data log_data[] = {
 		{ VAD_PROP_VOICE_THRESHOLD, threshold },
@@ -974,31 +1057,33 @@ static void log_endpointer_start_event(struct gdf_pvt *pvt)
 		{ VAD_PROP_SILENCE_DURATION, silence_duration },
 	};
 
-	ao2_lock(pvt);
-	pvt_threshold = pvt->voice_threshold;
-	pvt_voice_duration = pvt->voice_minimum_duration;
-	pvt_silence_duration = pvt->silence_minimum_duration;
-	ao2_unlock(pvt);
+	sprintf(threshold, "%d", req->voice_threshold);
+	sprintf(voice_duration, "%d", req->voice_minimum_duration);
+	sprintf(silence_duration, "%d", req->silence_minimum_duration);
 
-	sprintf(threshold, "%d", pvt_threshold);
-	sprintf(voice_duration, "%d", pvt_voice_duration);
-	sprintf(silence_duration, "%d", pvt_silence_duration);
-
-	gdf_log_call_event(pvt, CALL_LOG_TYPE_ENDPOINTER, "start", ARRAY_LEN(log_data), log_data);
+	gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "start", ARRAY_LEN(log_data), log_data);
 }
 
 static int gdf_start(struct ast_speech *speech)
 {
 	struct gdf_pvt *pvt = speech->data;
 
+	if (should_start_call_log(pvt)) {
+		start_call_log(pvt);
+	}
+
 	ao2_lock(pvt);
-	pvt->state = GDFE_STATE_START;
+	if (pvt->current_request) {
+		ao2_t_ref(pvt->current_request, -1, "Cancel in-progress request for a new one");
+		pvt->current_request = NULL;
+	}
+	pvt->current_request = create_new_request(pvt, pvt->utterance_counter++);
 	ao2_unlock(pvt);
 
 	return 0;
 }
 
-static int write_audio_frame(struct gdf_pvt *pvt, void *data, int len)
+static int write_audio_frame(struct gdf_request *req, void *data, int len)
 {
 	enum dialogflow_session_state state;
 	enum VAD_STATE vad_state;
@@ -1022,14 +1107,14 @@ static int write_audio_frame(struct gdf_pvt *pvt, void *data, int len)
 	mulaw_len = datasamples * sizeof(char);
 	mulaw = alloca(mulaw_len);
 
-	ao2_lock(pvt);
-	orig_vad_state = vad_state = pvt->vad_state;
-	threshold = pvt->voice_threshold;
-	cur_duration = pvt->vad_state_duration;
-	change_duration = pvt->vad_change_duration;
-	voice_duration = pvt->voice_minimum_duration;
-	silence_duration = pvt->silence_minimum_duration;
-	ao2_unlock(pvt);
+	ao2_lock(req);
+	orig_vad_state = vad_state = req->vad_state;
+	threshold = req->voice_threshold;
+	cur_duration = req->vad_state_duration;
+	change_duration = req->vad_change_duration;
+	voice_duration = req->voice_minimum_duration;
+	silence_duration = req->silence_minimum_duration;
+	ao2_unlock(req);
 
 	cfg = gdf_get_config();
 	if (cfg) {
@@ -1060,7 +1145,7 @@ static int write_audio_frame(struct gdf_pvt *pvt, void *data, int len)
 			vad_state = VAD_STATE_SPEAK;
 			change_duration = 0;
 			cur_duration = 0;
-			gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "start_of_speech");
+			gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "start_of_speech");
 		}
 	} else if (vad_state == VAD_STATE_SPEAK) {
 		if (change_duration >= silence_duration) {
@@ -1069,15 +1154,15 @@ static int write_audio_frame(struct gdf_pvt *pvt, void *data, int len)
 			vad_state = VAD_STATE_SILENT;
 			change_duration = 0;
 			cur_duration = 0;
-			gdf_log_call_event_only(pvt, CALL_LOG_TYPE_ENDPOINTER, "end_of_speech");
+			gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "end_of_speech");
 		}
 	}
 
-	ao2_lock(pvt);
-	pvt->vad_state = vad_state;
-	pvt->vad_state_duration = cur_duration;
-	pvt->vad_change_duration = change_duration;
-	ao2_unlock(pvt);
+	ao2_lock(req);
+	req->vad_state = vad_state;
+	req->vad_state_duration = cur_duration;
+	req->vad_change_duration = change_duration;
+	ao2_unlock(req);
 
 #ifdef RES_SPEECH_GDFE_DEBUG_VAD
 	ast_log(LOG_DEBUG, "avg: %d thr: %d dur: %d chg: %d vce: %d sil: %d old: %d new: %d\n",
@@ -1085,82 +1170,91 @@ static int write_audio_frame(struct gdf_pvt *pvt, void *data, int len)
 		orig_vad_state, vad_state);
 #endif
 
-	state = df_get_state(pvt->session);
+	state = df_get_state(req->session);
 	if (state == DF_STATE_READY && start_recognition_on_start) {
-		if (df_start_recognition(pvt->session, pvt->language, 0, (const char **)pvt->hints, pvt->hint_count)) {
-			ast_log(LOG_WARNING, "Error starting recognition on %s\n", pvt->session_id);
-			gdf_stop_recognition(pvt);
+		if (df_start_recognition(req->session, req->language, 0, (const char **)req->pvt->hints, req->pvt->hint_count)) {
+			ast_log(LOG_WARNING, "Error starting recognition on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
+			ao2_lock(req);
+			req->state = GDFE_STATE_DONE;
+			ao2_unlock(req);
 		}
-		ao2_lock(pvt);
-		pvt->last_audio_duration_ms = 0;
-		ao2_unlock(pvt);
+		ao2_lock(req);
+		req->last_audio_duration_ms = 0;
+		ao2_unlock(req);
 	}
 
 	for (i = 0; i < datasamples; i++) {
 		mulaw[i] = AST_LIN2MU(((short *)data)[i]);
 	}
 	
-	maybe_record_audio(pvt, mulaw, mulaw_len, vad_state);
-	maybe_cache_preendpointed_audio(pvt, mulaw, mulaw_len, vad_state);
+	maybe_record_audio(req, mulaw, mulaw_len, vad_state);
+	maybe_cache_preendpointed_audio(req, mulaw, mulaw_len, vad_state);
 
-	state = df_get_state(pvt->session);
+	state = df_get_state(req->session);
 	if (vad_state != VAD_STATE_START) {
 		if (orig_vad_state == VAD_STATE_START) {
 			if (state == DF_STATE_READY && !start_recognition_on_start) {
-				if (df_start_recognition(pvt->session, pvt->language, 0, (const char **)pvt->hints, pvt->hint_count)) {
-					state = df_get_state(pvt->session);
-					ast_log(LOG_WARNING, "Error starting recognition on %s (state is %d)\n", pvt->session_id, state);
-					gdf_stop_recognition(pvt);
+				if (df_start_recognition(req->session, req->language, 0, (const char **)req->pvt->hints, req->pvt->hint_count)) {
+					state = df_get_state(req->session);
+					ast_log(LOG_WARNING, "Error starting recognition on %d@%s (state is %d)\n", req->current_utterance_number, req->pvt->session_id, state);
+					ao2_lock(req);
+					req->state = GDFE_STATE_DONE;
+					ao2_unlock(req);
 				}
-				ao2_lock(pvt);
-				pvt->last_audio_duration_ms = 0;
-				ao2_unlock(pvt);
+				ao2_lock(req);
+				req->last_audio_duration_ms = 0;
+				ao2_unlock(req);
 			}
 
 			if (state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
 				size_t flush_start = 0;
 
-				coalesce_cached_audio_for_writing(pvt);
+				coalesce_cached_audio_for_writing(req);
 
-				while (flush_start < pvt->mulaw_endpointer_audio_cache_len && state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
-					if (flush_start + mulaw_len <= pvt->mulaw_endpointer_audio_cache_len) {
-						state = df_write_audio(pvt->session, pvt->mulaw_endpointer_audio_cache + flush_start, mulaw_len);
+				while (flush_start < req->mulaw_endpointer_audio_cache_len && state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
+					if (flush_start + mulaw_len <= req->mulaw_endpointer_audio_cache_len) {
+						state = df_write_audio(req->session, req->mulaw_endpointer_audio_cache + flush_start, mulaw_len);
 						flush_start += mulaw_len;
 					} else {
-						size_t partial_write_size = pvt->mulaw_endpointer_audio_cache_len - flush_start;
-						state = df_write_audio(pvt->session, pvt->mulaw_endpointer_audio_cache + flush_start, partial_write_size);
+						size_t partial_write_size = req->mulaw_endpointer_audio_cache_len - flush_start;
+						state = df_write_audio(req->session, req->mulaw_endpointer_audio_cache + flush_start, partial_write_size);
 						flush_start += partial_write_size;
 					}
 				}
 
-				ao2_lock(pvt);
-				pvt->last_audio_duration_ms += flush_start / 8;
-				ao2_unlock(pvt);
+				ao2_lock(req);
+				req->last_audio_duration_ms += flush_start / 8;
+				ao2_unlock(req);
 			}
 		}
 		if (state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
-			state = df_write_audio(pvt->session, mulaw, mulaw_len);
+			state = df_write_audio(req->session, mulaw, mulaw_len);
 
-			ao2_lock(pvt);
-			pvt->last_audio_duration_ms += mulaw_len / 8;
-			ao2_unlock(pvt);
+			ao2_lock(req);
+			req->last_audio_duration_ms += mulaw_len / 8;
+			ao2_unlock(req);
 		}
 
-		ao2_lock(pvt);
-		if (pvt->speech && !ast_test_flag(pvt->speech, AST_SPEECH_SPOKE) && df_get_response_count(pvt->session) > 0) {
-			ast_set_flag(pvt->speech, AST_SPEECH_QUIET);
-			ast_set_flag(pvt->speech, AST_SPEECH_SPOKE);
+		ao2_lock(req->pvt);
+		if (req->pvt->current_request == req) {
+			if (req->pvt->speech && !ast_test_flag(req->pvt->speech, AST_SPEECH_SPOKE) && df_get_response_count(req->session) > 0) {
+				ast_log(LOG_DEBUG, "Setting heard speech on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
+				ast_set_flag(req->pvt->speech, AST_SPEECH_QUIET);
+				ast_set_flag(req->pvt->speech, AST_SPEECH_SPOKE);
+			}
 		}
-		ao2_unlock(pvt);
+		ao2_unlock(req->pvt);
 	}
 	if (state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
-		gdf_stop_recognition(pvt);
+		ao2_lock(req);
+		req->state = GDFE_STATE_DONE;
+		ao2_unlock(req);
 	}
 
 	return 0;
 }
 
-static int start_dialogflow_recognition(struct gdf_pvt *pvt)
+static int start_dialogflow_recognition(struct gdf_request *req)
 {
 	char *event = NULL;
 	char *language = NULL;
@@ -1170,44 +1264,44 @@ static int start_dialogflow_recognition(struct gdf_pvt *pvt)
 	int request_sentiment_analysis;
 	enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state;
 
-	ao2_lock(pvt);
-	event = ast_strdupa(pvt->event);
-	language = ast_strdupa(pvt->language);
-	project_id = ast_strdupa(pvt->project_id);
-	endpoint = ast_strdupa(pvt->endpoint);
-	service_key = ast_strdupa(pvt->service_key);
-	request_sentiment_analysis = pvt->request_sentiment_analysis;
-	sentiment_analysis_state = pvt->effective_sentiment_analysis_state;
-	ast_string_field_set(pvt, event, "");
-	pvt->vad_state = VAD_STATE_START;
-	pvt->vad_state_duration = 0;
-	pvt->vad_change_duration = 0;
-	pvt->utterance_counter++;
-	pvt->request_start = ast_tvnow();
-	pvt->state = GDFE_STATE_PROCESSING;
-	ao2_unlock(pvt);
-
-	df_set_project_id(pvt->session, project_id);
-	df_set_endpoint(pvt->session, endpoint);
-	df_set_auth_key(pvt->session, service_key);
-
-	if (should_start_call_log(pvt)) {
-		start_call_log(pvt);
+	ao2_lock(req->pvt);
+	if (req->pvt->current_request != req) {
+		ao2_unlock(req->pvt);
+		return -1;
 	}
+	ao2_unlock(req->pvt);
+
+	event = ast_strdupa(req->event);
+	language = ast_strdupa(req->language);
+	project_id = ast_strdupa(req->project_id);
+	endpoint = ast_strdupa(req->endpoint);
+	service_key = ast_strdupa(req->service_key);
+	request_sentiment_analysis = req->pvt->request_sentiment_analysis;
+	sentiment_analysis_state = req->pvt->effective_sentiment_analysis_state;
+
+	req->vad_state = VAD_STATE_START;
+	req->vad_state_duration = 0;
+	req->vad_change_duration = 0;
+	req->request_start = ast_tvnow();
+	req->state = GDFE_STATE_PROCESSING;
+
+	df_set_project_id(req->session, project_id);
+	df_set_endpoint(req->session, endpoint);
+	df_set_auth_key(req->session, service_key);
 
 	if (request_sentiment_analysis) {
 		if (sentiment_analysis_state == SENTIMENT_ANALYSIS_NEVER) {
-			ast_log(LOG_DEBUG, "Refusing to do sentiment analysis on %s due to configuration prohibition.\n", pvt->session_id);
+			ast_log(LOG_DEBUG, "Refusing to do sentiment analysis on %d@%s due to configuration prohibition.\n", req->current_utterance_number, req->pvt->session_id);
 			request_sentiment_analysis = 0;
 		}
 	} else {
 		if (sentiment_analysis_state == SENTIMENT_ANALYSIS_ALWAYS) {
-			ast_log(LOG_DEBUG, "Forcing sentiment analysis on %s due to configuration.\n", pvt->session_id);
+			ast_log(LOG_DEBUG, "Forcing sentiment analysis on %d@%s due to configuration.\n", req->current_utterance_number, req->pvt->session_id);
 			request_sentiment_analysis = 1;
 		}
 	}
-	ast_log(LOG_DEBUG, "%sequesting sentiment analysis on %s\n", request_sentiment_analysis ? "R" : "Not r", pvt->session_id);
-	df_set_request_sentiment_analysis(pvt->session, request_sentiment_analysis);
+	ast_log(LOG_DEBUG, "%sequesting sentiment analysis on %d@%s\n", request_sentiment_analysis ? "R" : "Not r", req->current_utterance_number, req->pvt->session_id);
+	df_set_request_sentiment_analysis(req->session, request_sentiment_analysis);
 
 	{
 		char utterance_number[11];
@@ -1215,35 +1309,37 @@ static int start_dialogflow_recognition(struct gdf_pvt *pvt)
 			{ "event", event },
 			{ "language", language },
 			{ "project_id", project_id },
-			{ "logical_agent_name", pvt->logical_agent_name },
+			{ "logical_agent_name", req->pvt->logical_agent_name },
 			{ "utterance", utterance_number },
-			{ "context", pvt->call_logging_context },
-			{ "application", pvt->call_logging_application_name }
+			{ "context", req->pvt->call_logging_context },
+			{ "application", req->pvt->call_logging_application_name }
 		};
-		sprintf(utterance_number, "%d", pvt->utterance_counter);
-		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "start", ARRAY_LEN(log_data), log_data);
+		sprintf(utterance_number, "%d", req->current_utterance_number);
+		gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_RECOGNITION, "start", ARRAY_LEN(log_data), log_data);
 	}
-	log_endpointer_start_event(pvt);
+	log_endpointer_start_event(req);
 	
 	if (!ast_strlen_zero(event)) {
-		if (df_recognize_event(pvt->session, event, language, 0)) {
-			ast_log(LOG_WARNING, "Error recognizing event on %s\n", pvt->session_id);
-			ao2_lock(pvt);
-			if (pvt->speech) {
-				ast_speech_change_state(pvt->speech, AST_SPEECH_STATE_NOT_READY);
+		if (df_recognize_event(req->session, event, language, 0)) {
+			ast_log(LOG_WARNING, "Error recognizing event on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
+			ao2_lock(req->pvt);
+			if (req->pvt->current_request == req && req->pvt->speech) {
+				ast_speech_change_state(req->pvt->speech, AST_SPEECH_STATE_NOT_READY);
 			}
-			pvt->state = GDFE_STATE_HAVE_RESULTS;
-			ao2_unlock(pvt);
+			req->state = GDFE_STATE_HAVE_RESULTS;
+			ao2_unlock(req->pvt);
 		} else {
-			gdf_stop_recognition(pvt);
+			ao2_lock(req);
+			req->state = GDFE_STATE_DONE;
+			ao2_unlock(req);
 		}
 	} else {
-		df_connect(pvt->session);
-		ao2_lock(pvt);
-		if (pvt->speech) {
-			ast_speech_change_state(pvt->speech, AST_SPEECH_STATE_READY);
+		df_connect(req->session);
+		ao2_lock(req->pvt);
+		if (req->pvt->current_request == req && req->pvt->speech) {
+			ast_speech_change_state(req->pvt->speech, AST_SPEECH_STATE_READY);
 		}
-		ao2_unlock(pvt);
+		ao2_unlock(req->pvt);
 	}
 
 	return 0;
@@ -1251,64 +1347,59 @@ static int start_dialogflow_recognition(struct gdf_pvt *pvt)
 
 static void *gdf_exec(void *arg)
 {
-	struct gdf_pvt *pvt = arg;
+	struct gdf_request *req = arg;
 
-	ast_log(LOG_DEBUG, "Starting background thread for GDF %s\n", pvt->session_id);
+	ast_log(LOG_DEBUG, "Starting background thread for GDF %d@%s\n", req->current_utterance_number, req->pvt->session_id);
 
-	ao2_lock(pvt);
-	while (pvt->state != GDFE_STATE_DONE)
+	ao2_lock(req);
+	while (req->state != GDFE_STATE_DONE)
 	{
 		struct timespec ts;
 		int time_sleep_ms = 20;
+		int cancelled;
 
-		ao2_unlock(pvt);
+		ao2_unlock(req);
 		
 		ts.tv_sec = time_sleep_ms / 1000;
 		ts.tv_nsec = (time_sleep_ms % 1000) * 1000000;
 		
 		nanosleep(&ts, NULL);
 
-		ao2_lock(pvt);
-		if (pvt->state == GDFE_STATE_START) {
-			ao2_unlock(pvt);
-			start_dialogflow_recognition(pvt);
-			ao2_lock(pvt);
+		ao2_lock(req);
+		if (req->state == GDFE_STATE_START) {
+			ao2_unlock(req);
+			start_dialogflow_recognition(req);
+			ao2_lock(req);
 		}
-		if (pvt->state == GDFE_STATE_PROCESSING && 
-			pvt->speech && pvt->speech->state == AST_SPEECH_STATE_NOT_READY) {
-				ao2_unlock(pvt);
-				gdf_log_call_event_only(pvt, CALL_LOG_TYPE_RECOGNITION, "cancelled");
-
-				gdf_stop_recognition(pvt);
-				ao2_lock(pvt);
+		ao2_unlock(req);
+		ao2_lock(req->pvt);
+		cancelled = req->pvt->current_request != req || (req->pvt->speech && req->pvt->speech->state == AST_SPEECH_STATE_NOT_READY);
+		ao2_unlock(req->pvt);
+		ao2_lock(req);
+		if (req->state == GDFE_STATE_PROCESSING && cancelled) {
+				ao2_unlock(req);
+				gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_RECOGNITION, "cancelled");
+				ao2_lock(req);
+				req->state = GDFE_STATE_DONE;
 		}
-		while (pvt->state == GDFE_STATE_PROCESSING && pvt->frame_queue_len > 0) {
-			struct ast_frame *f = AST_LIST_REMOVE_HEAD(&pvt->frame_queue, frame_list);
-			pvt->frame_queue_len--;
+		while (req->state == GDFE_STATE_PROCESSING && req->frame_queue_len > 0) {
+			struct ast_frame *f = AST_LIST_REMOVE_HEAD(&req->frame_queue, frame_list);
+			req->frame_queue_len--;
 			if (f) {
-				ao2_unlock(pvt);
-				write_audio_frame(pvt, f->data.ptr, f->datalen);
+				ao2_unlock(req);
+				write_audio_frame(req, f->data.ptr, f->datalen);
 				ast_frfree(f);
-				ao2_lock(pvt);
+				ao2_lock(req);
 			}
 		}
 	}
-	if (pvt->speech && pvt->speech->state == AST_SPEECH_STATE_READY) {
-		gdf_stop_recognition(pvt);
-	}
+	ao2_unlock(req);
 
-	if (!ast_strlen_zero(pvt->lastAudioResponse)) {
-		unlink(pvt->lastAudioResponse);
-	}
+	gdf_stop_recognition(req);
 
-	df_close_session(pvt->session);
-	ao2_t_ref(pvt, -1, "For ref no longer tracked by dialogflow driver");
+	ast_log(LOG_DEBUG, "Exiting background thread for GDF %d@%s\n", req->current_utterance_number, req->pvt->session_id);
 
-	ao2_unlock(pvt);
-
-	ast_log(LOG_DEBUG, "Exiting background thread for GDF %s\n", pvt->session_id);
-
-	ao2_t_ref(pvt, -1, "Done with exec loop");
+	ao2_t_ref(req, -1, "Done with exec loop");
 
 	return NULL;
 }
@@ -1319,22 +1410,20 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 
 	if (!strcasecmp(name, GDF_PROP_SESSION_ID_NAME) || !strcasecmp(name, GDF_PROP_ALTERNATE_SESSION_NAME)) {
 		if (ast_strlen_zero(value)) {
-			ast_log(LOG_WARNING, "Session ID must have a value, refusing to set to nothing (remains %s)\n", df_get_session_id(pvt->session));
+			ast_log(LOG_WARNING, "Session ID must have a value, refusing to set to nothing (remains %s)\n", pvt->session_id);
 			return -1;
 		}
-		df_set_session_id(pvt->session, value);
 		ao2_lock(pvt);
 		ast_string_field_set(pvt, session_id, value);
 		ao2_unlock(pvt);
 	} else if (!strcasecmp(name, GDF_PROP_PROJECT_ID_NAME)) {
 		if (ast_strlen_zero(value)) {
-			ast_log(LOG_WARNING, "Project ID must have a value, refusing to set to nothing (remains %s)\n", df_get_project_id(pvt->session));
+			ast_log(LOG_WARNING, "Project ID must have a value, refusing to set to nothing (remains %s)\n", pvt->session_id);
 			return -1;
 		}
 		ao2_lock(pvt);
 		ast_string_field_set(pvt, project_id, value);
 		ao2_unlock(pvt);
-		df_set_project_id(pvt->session, value);
 	} else if (!strcasecmp(name, GDF_PROP_LANGUAGE_NAME)) {
 		ao2_lock(pvt);
 		ast_string_field_set(pvt, language, value);
@@ -1397,17 +1486,17 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 		struct dialogflow_log_data log_data[] = {
 			{ "prompt", S_OR(value, "") }
 		};
-		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "prompt_start", ARRAY_LEN(log_data), log_data);
+		gdf_log_call_event(pvt, pvt->current_request, CALL_LOG_TYPE_RECOGNITION, "prompt_start", ARRAY_LEN(log_data), log_data);
 	} else if (!strcasecmp(name, "logPromptStop")) {
 		struct dialogflow_log_data log_data[] = {
 			{ "reason", S_OR(value, "none") }
 		};
-		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "prompt_stop", ARRAY_LEN(log_data), log_data);
+		gdf_log_call_event(pvt, pvt->current_request, CALL_LOG_TYPE_RECOGNITION, "prompt_stop", ARRAY_LEN(log_data), log_data);
 	} else if (!strcasecmp(name, "logDtmf")) {
 		struct dialogflow_log_data log_data[] = {
 			{ "digits", S_OR(value, "") }
 		};
-		gdf_log_call_event(pvt, CALL_LOG_TYPE_RECOGNITION, "digits", ARRAY_LEN(log_data), log_data);
+		gdf_log_call_event(pvt, pvt->current_request, CALL_LOG_TYPE_RECOGNITION, "digits", ARRAY_LEN(log_data), log_data);
 	} else if (!strcasecmp(name, "record") || !strcasecmp(name, "recordUtterance")) {
 		ao2_lock(pvt);
 		pvt->record_next_utterance = ast_true(value);
@@ -1426,15 +1515,17 @@ static int gdf_get_setting(struct ast_speech *speech, const char *name, char *bu
 	struct gdf_pvt *pvt = speech->data;
 
 	if (!strcasecmp(name, GDF_PROP_UTTERANCE_DURATION_MS)) {
-		long long last_audio_duration_ms;
+		long long last_audio_duration_ms = 0;
 		ao2_lock(pvt);
-		last_audio_duration_ms = pvt->last_audio_duration_ms;
+		if (pvt->current_request) {
+			last_audio_duration_ms = pvt->current_request->last_audio_duration_ms;
+		}
 		ao2_unlock(pvt);
 		ast_build_string(&buf, &len, "%lld", last_audio_duration_ms);
 	} else if (!strcasecmp(name, GDF_PROP_SESSION_ID_NAME)) {
-		ast_copy_string(buf, df_get_session_id(pvt->session), len);
+		ast_copy_string(buf, pvt->session_id, len);
 	} else if (!strcasecmp(name, GDF_PROP_PROJECT_ID_NAME)) {
-		ast_copy_string(buf, df_get_project_id(pvt->session), len);
+		ast_copy_string(buf, pvt->session_id, len);
 	} else if (!strcasecmp(name, GDF_PROP_LANGUAGE_NAME)) {
 		ao2_lock(pvt);
 		ast_copy_string(buf, pvt->language, len);
@@ -1469,7 +1560,8 @@ static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
 {
 	/* speech is not locked */
 	struct gdf_pvt *pvt = speech->data;
-	int results = df_get_result_count(pvt->session);
+	struct gdf_request *req = pvt->current_request;
+	int results;
 	int i;
 	struct ast_speech_result *start = NULL;
 	struct ast_speech_result *end = NULL;
@@ -1480,8 +1572,14 @@ static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
 
 	const char *audioFile = NULL;
 
+	if (!req || !req->session) {
+		return NULL;
+	}
+
+	results = df_get_result_count(req->session);
+
 	for (i = 0; i < results; i++) {
-		struct dialogflow_result *df_result = df_get_result(pvt->session, i); /* this is a borrowed reference */
+		struct dialogflow_result *df_result = df_get_result(req->session, i); /* this is a borrowed reference */
 		if (df_result) {
 			if (!strcasecmp(df_result->slot, "output_audio")) {
 				/* this is fine for now, but we really need a flag on the structure that says it's binary vs. text */
@@ -1543,7 +1641,7 @@ static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
 				start = end = new;
 			}
 		} else {
-			ast_log(LOG_WARNING, "Unable to allocate speech result slot for synthesized fulfillment text\n");
+			ast_log(LOG_WARNING, "Unable to allocate speech result slot for fulfillment audio\n");
 		}
 	} else if (fulfillment_text && !ast_strlen_zero(fulfillment_text->value)) {
 		char tmpFilename[128];
@@ -1593,10 +1691,11 @@ static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
 		}
 	}
 
+	if (!ast_strlen_zero(pvt->lastAudioResponse)) {
+		unlink(pvt->lastAudioResponse);
+		ast_string_field_set(pvt, lastAudioResponse, "");
+	}
 	if (!ast_strlen_zero(audioFile)) {
-		if (!ast_strlen_zero(pvt->lastAudioResponse)) {
-			unlink(pvt->lastAudioResponse);
-		}
 		ast_string_field_set(pvt, lastAudioResponse, audioFile);
 	}
 
@@ -2110,7 +2209,7 @@ static int call_log_enabled_for_pvt(struct gdf_pvt *pvt)
 #define AST_ISO8601_LEN	29
 #endif
 
-static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type, const char *event, size_t log_data_size, const struct dialogflow_log_data *log_data)
+static void gdf_log_call_event(struct gdf_pvt *pvt, struct gdf_request *req, enum gdf_call_log_type type, const char *event, size_t log_data_size, const struct dialogflow_log_data *log_data)
 {
 	struct timeval timeval_now;
 	struct ast_tm tm_now = {};
@@ -2168,6 +2267,9 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, enum gdf_call_log_type type,
 	json_object_set_new(log_message, "log_timestamp", json_string(char_now));
 	json_object_set_new(log_message, "log_type", json_string(char_type));
 	json_object_set_new(log_message, "log_event", json_string(event));
+	if (req) {
+		json_object_set_new(log_message, "request_number", json_integer(req->current_utterance_number));
+	}
 	for (i = 0; i < log_data_size; i++) {
 		if (log_data[i].value_type == dialogflow_log_data_value_type_string) {
 			json_object_set_new(log_message, log_data[i].name, json_string((const char *)log_data[i].value));
@@ -2218,8 +2320,8 @@ static void libdialogflow_general_logging_callback(enum dialogflow_log_level lev
 
 static void libdialogflow_call_logging_callback(void *user_data, const char *event, size_t log_data_size, const struct dialogflow_log_data *data)
 {
-	struct gdf_pvt *pvt = (struct gdf_pvt *) user_data;
-	gdf_log_call_event(pvt, CALL_LOG_TYPE_DIALOGFLOW, event, log_data_size, data);
+	struct gdf_request *req = (struct gdf_request *) user_data;
+	gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_DIALOGFLOW, event, log_data_size, data);
 }
 
 static char gdf_engine_name[] = "GoogleDFE";
