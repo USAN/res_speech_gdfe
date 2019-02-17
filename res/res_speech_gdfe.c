@@ -172,6 +172,7 @@ struct gdf_request {
 	size_t mulaw_endpointer_audio_cache_len;
 
 	struct timeval session_start; /* log only, no store duration */
+	struct timeval endpointer_end_of_speech_time;
 	struct timeval request_start;
 	long long last_request_duration_ms;
 	long long last_audio_duration_ms; /* calculated by packet, not clock */
@@ -187,6 +188,8 @@ struct gdf_request {
 		AST_STRING_FIELD(endpoint);
 		AST_STRING_FIELD(event);
 		AST_STRING_FIELD(language);
+		AST_STRING_FIELD(pre_recording_filename);
+		AST_STRING_FIELD(post_recording_filename);
 	);
 };
 
@@ -633,13 +636,27 @@ static void write_end_of_recognition_call_event(struct gdf_request *req)
 {
 	char duration_buffer[21] = "";
 	char utterance_duration_buffer[21] = "";
+	char speech_rec_duration_buffer[21] = "";
+	char dialogflow_response_time_buffer[21] = "";
+	char intent_latency_time_buffer[21] = "";
+	struct timeval dialogflow_start_time = df_get_session_start_time(req->session);
+	struct timeval last_transcription_time = df_get_session_last_transcription_time(req->session);
+	struct timeval intent_detect_time = df_get_session_intent_detected_time(req->session);
 	struct dialogflow_log_data log_data[] = {
 		{ "duration_ms", duration_buffer },
-		{ "utterance_duration_ms", utterance_duration_buffer }
+		{ "utterance_duration_ms", utterance_duration_buffer },
+		{ "speech_rec_duration_ms", speech_rec_duration_buffer },
+		{ "dialogflow_response_time_ms", dialogflow_response_time_buffer },
+		{ "intent_latency_time_ms", intent_latency_time_buffer },
+		{ "pre_recording", req->pre_recording_filename },
+		{ "post_recording", req->post_recording_filename }
 	};
 
 	sprintf(duration_buffer, "%lld", req->last_request_duration_ms);
 	sprintf(utterance_duration_buffer, "%lld", req->last_audio_duration_ms);
+	sprintf(speech_rec_duration_buffer, "%lld", (long long) ast_tvdiff_ms(last_transcription_time, dialogflow_start_time));
+	sprintf(dialogflow_response_time_buffer, "%lld", (long long) ast_tvdiff_ms(intent_detect_time, last_transcription_time));
+	sprintf(intent_latency_time_buffer, "%lld", (long long) ast_tvdiff_ms(intent_detect_time, req->endpointer_end_of_speech_time));
 
 	gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_RECOGNITION, "stop", ARRAY_LEN(log_data), log_data);
 }
@@ -661,6 +678,7 @@ static int open_preendpointed_recording_file(struct gdf_request *req)
 		gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "pre_recording_start", ARRAY_LEN(log_data), log_data);
 		ast_log(LOG_DEBUG, "Opened %s for preendpointer recording for %d@%s\n", ast_str_buffer(path), req->current_utterance_number, req->pvt->session_id);
 		ao2_lock(req);
+		ast_string_field_set(req, pre_recording_filename, ast_str_buffer(path));
 		req->utterance_preendpointer_recording_file_handle = record_file;
 		ao2_unlock(req);
 	} else {
@@ -687,6 +705,7 @@ static int open_postendpointed_recording_file(struct gdf_request *req)
 		gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "post_recording_start", ARRAY_LEN(log_data), log_data);
 		ast_log(LOG_DEBUG, "Opened %s for postendpointer recording for %d@%s\n", ast_str_buffer(path), req->current_utterance_number, req->pvt->session_id);
 		ao2_lock(req);
+		ast_string_field_set(req, post_recording_filename, ast_str_buffer(path));
 		req->utterance_postendpointer_recording_file_handle = record_file;
 		ao2_unlock(req);
 	} else {
@@ -1028,9 +1047,13 @@ static void start_call_log(struct gdf_pvt *pvt)
 
 		log_file = fopen(ast_str_buffer(path), "w");
 		if (log_file) {
+			char hostname[HOST_NAME_MAX] = "";
 			struct dialogflow_log_data log_data[] = {
-				{ "application", pvt->call_logging_application_name }
+				{ "application", pvt->call_logging_application_name },
+				{ "hostname", hostname }
 			};
+
+			gethostname(hostname, sizeof(hostname) - 1);
 
 			ast_log(LOG_DEBUG, "Opened %s for call log for %s\n", ast_str_buffer(path), pvt->session_id);
 			ao2_lock(pvt);
@@ -1155,6 +1178,9 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 			change_duration = 0;
 			cur_duration = 0;
 			gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "end_of_speech");
+			ao2_lock(req);
+			req->endpointer_end_of_speech_time = ast_tvnow();
+			ao2_unlock(req);
 		}
 	}
 
