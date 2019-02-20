@@ -222,6 +222,8 @@ struct gdf_config {
 	struct ao2_container *logical_agents;
 	struct ao2_container *hints;
 
+	int synthesize_fulfillment_text;
+
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(service_key);
 		AST_STRING_FIELD(endpoint);
@@ -1598,10 +1600,13 @@ static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
 
 	const char *audioFile = NULL;
 
+	struct gdf_config *cfg;
+
 	if (!req || !req->session) {
 		return NULL;
 	}
 
+	cfg = gdf_get_config();
 	results = df_get_result_count(req->session);
 
 	for (i = 0; i < results; i++) {
@@ -1669,7 +1674,7 @@ static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
 		} else {
 			ast_log(LOG_WARNING, "Unable to allocate speech result slot for fulfillment audio\n");
 		}
-	} else if (fulfillment_text && !ast_strlen_zero(fulfillment_text->value)) {
+	} else if (cfg->synthesize_fulfillment_text && fulfillment_text && !ast_strlen_zero(fulfillment_text->value)) {
 		char tmpFilename[128];
 		int fd;
 		struct gdf_config *cfg;
@@ -1716,6 +1721,8 @@ static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
 			}
 		}
 	}
+
+	ao2_t_ref(cfg, -1, "done with config");
 
 	if (!ast_strlen_zero(pvt->lastAudioResponse)) {
 		unlink(pvt->lastAudioResponse);
@@ -2038,6 +2045,12 @@ static int load_config(int reload)
 		val = ast_variable_retrieve(cfg, "general", "start_recognition_on_start");
 		if (!ast_strlen_zero(val)) {
 			conf->start_recognition_on_start = ast_true(val);
+		}
+
+		conf->synthesize_fulfillment_text = 0;
+		val = ast_variable_retrieve(cfg, "general", "synthesize_fulfillment_text");
+		if (!ast_strlen_zero(val)) {
+			conf->synthesize_fulfillment_text = ast_true(val);
 		}
 
 		if (conf->hints) {
