@@ -408,6 +408,7 @@ static struct gdf_request *create_new_request(struct gdf_pvt *pvt_locked, int ut
 
 	ast_log(LOG_DEBUG, "Creating GDF request %d@%s\n", req->current_utterance_number, pvt_locked->session_id);
 
+	ast_speech_change_state(pvt_locked->speech, AST_SPEECH_STATE_READY);
 
 	ao2_t_ref(req, 1, "Bump ref for background thread");
 	res = ast_pthread_create_detached(&req->thread, NULL, gdf_exec, req);
@@ -1364,11 +1365,6 @@ static int start_dialogflow_recognition(struct gdf_request *req)
 		}
 	} else {
 		df_connect(req->session);
-		ao2_lock(req->pvt);
-		if (req->pvt->current_request == req && req->pvt->speech) {
-			ast_speech_change_state(req->pvt->speech, AST_SPEECH_STATE_READY);
-		}
-		ao2_unlock(req->pvt);
 	}
 
 	return 0;
