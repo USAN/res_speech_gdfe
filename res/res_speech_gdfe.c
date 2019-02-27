@@ -357,7 +357,7 @@ static struct gdf_request *create_new_request(struct gdf_pvt *pvt, int utterance
 	int res;
 
 	req = ao2_alloc(sizeof(struct gdf_request), gdf_request_destructor);
-	if (!pvt) {
+	if (!req) {
 		ast_log(LOG_WARNING, "Error allocating memory for GDF request structure\n");
 		return NULL;
 	}
