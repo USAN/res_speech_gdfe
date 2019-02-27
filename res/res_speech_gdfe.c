@@ -350,7 +350,7 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	return 0;
 }
 
-static struct gdf_request *create_new_request(struct gdf_pvt *pvt, int utterance_number)
+static struct gdf_request *create_new_request(struct gdf_pvt *pvt_locked, int utterance_number)
 {
 	struct gdf_request *req;
 	struct gdf_config *cfg;
@@ -368,8 +368,8 @@ static struct gdf_request *create_new_request(struct gdf_pvt *pvt, int utterance
 		return NULL;
 	}
 
-	ao2_t_ref(pvt, 1, "Adding backpointer from request to private");
-	req->pvt = pvt;
+	ao2_t_ref(pvt_locked, 1, "Adding backpointer from request to private");
+	req->pvt = pvt_locked;
 	req->current_utterance_number = utterance_number;
 
 	cfg = gdf_get_config();
@@ -381,19 +381,19 @@ static struct gdf_request *create_new_request(struct gdf_pvt *pvt, int utterance
 		ao2_t_ref(req, -1, "Error creating dialogflow request");
 		return NULL;
 	}
-	df_set_auth_key(req->session, pvt->service_key);
-	df_set_endpoint(req->session, pvt->endpoint);
-	df_set_session_id(req->session, pvt->session_id);
+	df_set_auth_key(req->session, pvt_locked->service_key);
+	df_set_endpoint(req->session, pvt_locked->endpoint);
+	df_set_session_id(req->session, pvt_locked->session_id);
 
-	ast_string_field_set(req, project_id, pvt->project_id);
-	ast_string_field_set(req, event, pvt->event);
-	ast_string_field_set(req, language, pvt->language);
-	ast_string_field_set(req, service_key, pvt->service_key);
-	ast_string_field_set(req, endpoint, pvt->endpoint);
+	ast_string_field_set(req, project_id, pvt_locked->project_id);
+	ast_string_field_set(req, event, pvt_locked->event);
+	ast_string_field_set(req, language, pvt_locked->language);
+	ast_string_field_set(req, service_key, pvt_locked->service_key);
+	ast_string_field_set(req, endpoint, pvt_locked->endpoint);
 
-	req->voice_threshold = pvt->voice_threshold;
-	req->voice_minimum_duration = pvt->voice_minimum_duration;
-	req->silence_minimum_duration = pvt->silence_minimum_duration;
+	req->voice_threshold = pvt_locked->voice_threshold;
+	req->voice_minimum_duration = pvt_locked->voice_minimum_duration;
+	req->silence_minimum_duration = pvt_locked->silence_minimum_duration;
 	req->session_start = ast_tvnow();
 
 	if (req->voice_minimum_duration || cfg->endpointer_cache_audio_pretrigger_ms) {
@@ -406,7 +406,8 @@ static struct gdf_request *create_new_request(struct gdf_pvt *pvt, int utterance
 		}
 	}
 
-	ast_log(LOG_DEBUG, "Creating GDF request %d@%s\n", req->current_utterance_number, pvt->session_id);
+	ast_log(LOG_DEBUG, "Creating GDF request %d@%s\n", req->current_utterance_number, pvt_locked->session_id);
+
 
 	ao2_t_ref(req, 1, "Bump ref for background thread");
 	res = ast_pthread_create_detached(&req->thread, NULL, gdf_exec, req);
