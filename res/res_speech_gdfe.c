@@ -176,6 +176,7 @@ struct gdf_request {
 	struct timeval session_start; /* log only, no store duration */
 	struct timeval endpointer_end_of_speech_time;
 	struct timeval request_start;
+	struct timeval recognition_initial_attempt;
 	long long last_request_duration_ms;
 	long long last_audio_duration_ms; /* calculated by packet, not clock */
 
@@ -223,6 +224,7 @@ struct gdf_config {
 
 	int start_recognition_on_start; /* vs. on speech */
 	int recognition_start_failure_retries;
+	int recognition_start_failure_retry_max_time_ms;
 
 	struct ao2_container *logical_agents;
 	struct ao2_container *hints;
@@ -1136,6 +1138,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	int i;
 	int start_recognition_on_start = 0;
 	int recognition_start_failure_retries = 0;
+	int recognition_start_failure_retry_max_time_ms = 0;
 	const char *start_failure_retry_codes = "";
 	struct gdf_config *cfg;
 	int signal_end_of_speech = 0;
@@ -1158,6 +1161,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	if (cfg) {
 		start_recognition_on_start = cfg->start_recognition_on_start;
 		recognition_start_failure_retries = cfg->recognition_start_failure_retries;
+		recognition_start_failure_retry_max_time_ms = cfg->recognition_start_failure_retry_max_time_ms;
 		start_failure_retry_codes = ast_strdupa(cfg->start_failure_retry_codes);
 		ao2_t_ref(cfg, -1, "done checking for starting rec on call start");
 	}
@@ -1216,9 +1220,13 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 
 	state = df_get_state(req->session);
 	if (state == DF_STATE_READY && start_recognition_on_start) {
+		if (ast_tvzero(req->recognition_initial_attempt)) {
+			req->recognition_initial_attempt = ast_tvnow();
+		}
 		if (df_start_recognition(req->session, req->language, 0, (const char **)req->pvt->hints, req->pvt->hint_count)) {
 			int will_retry = 0;
-			if (req->current_start_retry < recognition_start_failure_retries) {
+			long long retry_duration = ast_tvdiff_ms(ast_tvnow(), req->recognition_initial_attempt);
+			if (req->current_start_retry < recognition_start_failure_retries && retry_duration < recognition_start_failure_retry_max_time_ms) {
 				int results;
 				int result_number;
 				ast_log(LOG_DEBUG, "Error pre-starting recognition on %d@%s -- might retry\n", req->current_utterance_number, req->pvt->session_id);
@@ -1265,9 +1273,13 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	if (vad_state != VAD_STATE_START) {
 		if (state == DF_STATE_READY) {
 			if (!start_recognition_on_start) {
+				if (ast_tvzero(req->recognition_initial_attempt)) {
+					req->recognition_initial_attempt = ast_tvnow();
+				}
 				if (df_start_recognition(req->session, req->language, 0, (const char **)req->pvt->hints, req->pvt->hint_count)) {
 					int will_retry = 0;
-					if (req->current_start_retry < recognition_start_failure_retries) {
+					long long retry_duration = ast_tvdiff_ms(ast_tvnow(), req->recognition_initial_attempt);
+					if (req->current_start_retry < recognition_start_failure_retries && retry_duration < recognition_start_failure_retry_max_time_ms) {
 						int results;
 						int result_number;
 						ast_log(LOG_DEBUG, "Error starting recognition on %d@%s -- might retry\n", req->current_utterance_number, req->pvt->session_id);
@@ -2150,6 +2162,17 @@ static int load_config(int reload)
 				ast_log(LOG_WARNING, "Invalid value '%s' for recognition_start_failure_retries\n", val);
 			}
 		}
+
+		conf->recognition_start_failure_retry_max_time_ms = 1000;
+		val = ast_variable_retrieve(cfg, "general", "recognition_start_failure_retry_max_time_ms");
+		if (!ast_strlen_zero(val)) {
+			int i;
+			if (1 == sscanf(val, "%d", &i)) {
+				conf->recognition_start_failure_retry_max_time_ms = i;
+			} else {
+				ast_log(LOG_WARNING, "Invalid value '%s' for recognition_start_failure_retry_max_time_ms\n", val);
+			}
+		}
 		
 		ast_string_field_set(conf, start_failure_retry_codes, ",14,");
 		val = ast_variable_retrieve(cfg, "general", "start_failure_retry_codes");
@@ -2296,6 +2319,7 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 																config->enable_sentiment_analysis == SENTIMENT_ANALYSIS_DEFAULT ? "default" : "never");
 			ast_cli(a->fd, "start_recognition_on_start = %s\n", AST_CLI_YESNO(config->start_recognition_on_start));
 			ast_cli(a->fd, "recognition_start_failure_retries = %d\n", config->recognition_start_failure_retries);
+			ast_cli(a->fd, "recognition_start_failure_retry_max_time_ms = %d\n", config->recognition_start_failure_retry_max_time_ms);
 			ast_cli(a->fd, "start_failure_retry_codes = %s\n", config->start_failure_retry_codes);
 			ast_cli(a->fd, "synthesize_fulfillment_text = %s\n", AST_CLI_YESNO(config->synthesize_fulfillment_text));
 			ast_cli(a->fd, "hints = ");
