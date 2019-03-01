@@ -120,6 +120,7 @@ struct gdf_pvt {
 
 	enum SENTIMENT_ANALYSIS_STATE effective_sentiment_analysis_state;
 	int request_sentiment_analysis;
+	int use_internal_endpointer_for_end_of_speech;
 
 	int record_next_utterance;
 
@@ -200,6 +201,7 @@ struct gdf_logical_agent {
 	const char *project_id;
 	const char *service_key;
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
+	int use_internal_endpointer_for_end_of_speech;
 	struct ao2_container *hints;
 	char endpoint[0];
 };
@@ -215,6 +217,7 @@ struct gdf_config {
 	int enable_preendpointer_recordings;
 	int enable_postendpointer_recordings;
 	int record_preendpointer_on_demand;
+	int use_internal_endpointer_for_end_of_speech;
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
 
 	int start_recognition_on_start; /* vs. on speech */
@@ -561,6 +564,7 @@ static void activate_agent_for_name(struct gdf_pvt *pvt, const char *name, size_
 		ast_string_field_set(pvt, event, event);
 		calculate_effective_sentiment_analysis_state(pvt, config, logical_agent_map);
 		calculate_effective_hints(pvt, config, logical_agent_map);
+		pvt->use_internal_endpointer_for_end_of_speech = logical_agent_map ? logical_agent_map->use_internal_endpointer_for_end_of_speech : config->use_internal_endpointer_for_end_of_speech;
 		ao2_unlock(pvt);
 		if (logical_agent_map) {
 			ao2_ref(logical_agent_map, -1);
@@ -571,6 +575,7 @@ static void activate_agent_for_name(struct gdf_pvt *pvt, const char *name, size_
 		ast_string_field_set(pvt, project_id, pvt->logical_agent_name);
 		ast_string_field_set(pvt, event, event);
 		calculate_effective_sentiment_analysis_state(pvt, NULL, NULL);
+		pvt->use_internal_endpointer_for_end_of_speech = 1;
 		ao2_unlock(pvt);
 	}
 
@@ -1128,6 +1133,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	int i;
 	int start_recognition_on_start = 0;
 	struct gdf_config *cfg;
+	int signal_end_of_speech = 0;
 
 	datasamples = len / sizeof(short); /* 2 bytes per sample for slin */;
 	datams = datasamples / 8; /* 8 samples per millisecond */;
@@ -1184,6 +1190,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 			gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "end_of_speech");
 			ao2_lock(req);
 			req->endpointer_end_of_speech_time = ast_tvnow();
+			signal_end_of_speech = req->pvt->use_internal_endpointer_for_end_of_speech;
 			ao2_unlock(req);
 		}
 	}
@@ -1275,7 +1282,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 		}
 		ao2_unlock(req->pvt);
 	}
-	if (state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
+ 	if (signal_end_of_speech || state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
 		ao2_lock(req);
 		req->state = GDFE_STATE_DONE;
 		ao2_unlock(req);
@@ -1292,6 +1299,7 @@ static int start_dialogflow_recognition(struct gdf_request *req)
 	char *endpoint = NULL;
 	char *service_key = NULL;
 	int request_sentiment_analysis;
+	int use_internal_endpointer_for_end_of_speech;
 	enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state;
 
 	ao2_lock(req->pvt);
@@ -1308,6 +1316,7 @@ static int start_dialogflow_recognition(struct gdf_request *req)
 	service_key = ast_strdupa(req->service_key);
 	request_sentiment_analysis = req->pvt->request_sentiment_analysis;
 	sentiment_analysis_state = req->pvt->effective_sentiment_analysis_state;
+	use_internal_endpointer_for_end_of_speech = req->pvt->use_internal_endpointer_for_end_of_speech;
 
 	req->vad_state = VAD_STATE_START;
 	req->vad_state_duration = 0;
@@ -1332,6 +1341,7 @@ static int start_dialogflow_recognition(struct gdf_request *req)
 	}
 	ast_log(LOG_DEBUG, "%sequesting sentiment analysis on %d@%s\n", request_sentiment_analysis ? "R" : "Not r", req->current_utterance_number, req->pvt->session_id);
 	df_set_request_sentiment_analysis(req->session, request_sentiment_analysis);
+	df_set_use_external_endpointer(req->session, use_internal_endpointer_for_end_of_speech);
 
 	{
 		char utterance_number[11];
@@ -1794,7 +1804,7 @@ static void parse_hints(struct ao2_container *hints, const char *val)
 
 static struct gdf_logical_agent *logical_agent_alloc(const char *name, const char *project_id, 
 	const char *service_key, const char *endpoint, enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state,
-	const char *hints)
+	const char *hints, int use_internal_endpointer_for_end_of_speech)
 {
 	size_t name_len = strlen(name);
 	size_t project_id_len = strlen(project_id);
@@ -1816,6 +1826,7 @@ static struct gdf_logical_agent *logical_agent_alloc(const char *name, const cha
 		agent->name = agent->project_id + project_id_len + 1;
 		ast_copy_string((char *)agent->name, name, name_len + 1);
 		agent->enable_sentiment_analysis = sentiment_analysis_state;
+		agent->use_internal_endpointer_for_end_of_speech = use_internal_endpointer_for_end_of_speech;
 
 		agent->hints = ao2_container_alloc(1, NULL, NULL);
 		if (agent->hints && !ast_strlen_zero(hints)) {
@@ -2050,6 +2061,12 @@ static int load_config(int reload)
 			conf->synthesize_fulfillment_text = ast_true(val);
 		}
 
+		conf->use_internal_endpointer_for_end_of_speech = 1;
+		val = ast_variable_retrieve(cfg, "general", "use_internal_endpointer_for_end_of_speech");
+		if (!ast_strlen_zero(val)) {
+			conf->use_internal_endpointer_for_end_of_speech = ast_true(val);
+		}
+		
 		if (conf->hints) {
 			val = ast_variable_retrieve(cfg, "general", "hints");
 			if (!ast_strlen_zero(val)) {
@@ -2066,6 +2083,8 @@ static int load_config(int reload)
 				const char *service_key = ast_variable_retrieve(cfg, category, "service_key");
 				const char *enable_sentiment_analysis = ast_variable_retrieve(cfg, category, "enable_sentiment_analysis");
 				const char *hints = ast_variable_retrieve(cfg, category, "hints");
+				const char *use_internal_endpointer_for_end_of_speech_str = ast_variable_retrieve(cfg, category, "use_internal_endpointer_for_end_of_speech");
+				int use_internal_endpointer_for_end_of_speech;
 				enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state = SENTIMENT_ANALYSIS_DEFAULT;
 
 				if (!ast_strlen_zero(service_key)) {
@@ -2074,6 +2093,11 @@ static int load_config(int reload)
 						service_key = ast_strdupa(ast_str_buffer(buffer));
 						ast_free(buffer);
 					}
+				}
+
+				use_internal_endpointer_for_end_of_speech = conf->use_internal_endpointer_for_end_of_speech;
+				if (!ast_strlen_zero(use_internal_endpointer_for_end_of_speech_str)) {
+					use_internal_endpointer_for_end_of_speech = ast_true(use_internal_endpointer_for_end_of_speech_str);
 				}
 
 				if (!ast_strlen_zero(enable_sentiment_analysis)) {
@@ -2089,7 +2113,7 @@ static int load_config(int reload)
 				if (!ast_strlen_zero(project_id)) {
 					struct gdf_logical_agent *agent;
 					
-					agent = logical_agent_alloc(name, project_id, S_OR(service_key, ""), S_OR(endpoint, ""), sentiment_analysis_state, hints);
+					agent = logical_agent_alloc(name, project_id, S_OR(service_key, ""), S_OR(endpoint, ""), sentiment_analysis_state, hints, use_internal_endpointer_for_end_of_speech);
 					if (agent) {
 						ao2_link(conf->logical_agents, agent);
 						ao2_ref(agent, -1);
