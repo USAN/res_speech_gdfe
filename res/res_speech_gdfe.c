@@ -199,13 +199,15 @@ struct gdf_request {
 struct ao2_container *config;
 
 struct gdf_logical_agent {
-	const char *name;
-	const char *project_id;
-	const char *service_key;
+	AST_DECLARE_STRING_FIELDS(
+		AST_STRING_FIELD(name);
+		AST_STRING_FIELD(project_id);
+		AST_STRING_FIELD(service_key);
+		AST_STRING_FIELD(endpoint);
+	);
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
 	int use_internal_endpointer_for_end_of_speech;
 	struct ao2_container *hints;
-	char endpoint[0];
 };
 
 struct gdf_config {
@@ -1856,6 +1858,7 @@ static void logical_agent_destructor(void *obj)
 	if (agent->hints) {
 		ao2_t_ref(agent->hints, -1, "destroying agent");
 	}
+	ast_string_field_free_memory(agent);
 }
 
 static void hint_destructor(void *obj)
@@ -1900,24 +1903,30 @@ static struct gdf_logical_agent *logical_agent_alloc(const char *name, const cha
 							endpoint_len + 1;
 	struct gdf_logical_agent *agent;
 	
-	agent = ao2_alloc(space_needed + sizeof(struct gdf_logical_agent), logical_agent_destructor);
-	if (agent) {
-		ast_copy_string(agent->endpoint, endpoint, endpoint_len + 1);
-		agent->service_key = agent->endpoint + endpoint_len + 1;
-		ast_copy_string((char *)agent->service_key, service_key, service_key_len + 1);
-		agent->project_id = agent->service_key + service_key_len + 1;
-		ast_copy_string((char *)agent->project_id, project_id, project_id_len + 1);
-		agent->name = agent->project_id + project_id_len + 1;
-		ast_copy_string((char *)agent->name, name, name_len + 1);
-		agent->enable_sentiment_analysis = sentiment_analysis_state;
-		agent->use_internal_endpointer_for_end_of_speech = use_internal_endpointer_for_end_of_speech;
-
-		agent->hints = ao2_container_alloc(1, NULL, NULL);
-		if (agent->hints && !ast_strlen_zero(hints)) {
-			parse_hints(agent->hints, hints);
-		}
+	agent = ao2_alloc(sizeof(struct gdf_logical_agent), logical_agent_destructor);
+	if (!agent) {
+		ast_log(LOG_WARNING, "Failed to allocate logical agent for %s\n", name);
+		return NULL;
 	}
 
+	if (ast_string_field_init(agent, space_needed)) {
+		ast_log(LOG_WARNING, "Failed to allocate string fields for logical agent %s\n", name);
+		ao2_t_ref(agent, -1, "Failed to allocate string fields");
+		return NULL;
+	}
+
+	ast_string_field_set(agent, name, name);
+	ast_string_field_set(agent, project_id, project_id);
+	ast_string_field_set(agent, service_key, service_key);
+	ast_string_field_set(agent, endpoint, endpoint);
+	agent->enable_sentiment_analysis = sentiment_analysis_state;
+	agent->use_internal_endpointer_for_end_of_speech = use_internal_endpointer_for_end_of_speech;
+
+	agent->hints = ao2_container_alloc(1, NULL, NULL);
+	if (agent->hints && !ast_strlen_zero(hints)) {
+		parse_hints(agent->hints, hints);
+	}
+	
 	return agent;
 }
 
