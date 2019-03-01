@@ -2145,7 +2145,7 @@ static int load_config(int reload)
 			conf->synthesize_fulfillment_text = ast_true(val);
 		}
 
-		conf->use_internal_endpointer_for_end_of_speech = 1;
+		conf->use_internal_endpointer_for_end_of_speech = 0;
 		val = ast_variable_retrieve(cfg, "general", "use_internal_endpointer_for_end_of_speech");
 		if (!ast_strlen_zero(val)) {
 			conf->use_internal_endpointer_for_end_of_speech = ast_true(val);
