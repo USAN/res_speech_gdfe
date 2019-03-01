@@ -1293,7 +1293,6 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 
 								sprintf(comma_code, ",%s,", df_result->value);
 								if (strstr(start_failure_retry_codes, comma_code)) {
-									ast_log(LOG_DEBUG, "Will retry.\n");
 									will_retry = 1;
 								}
 								break;
