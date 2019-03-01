@@ -151,6 +151,7 @@ struct gdf_request {
 	struct dialogflow_session *session;
 	
 	int current_utterance_number;
+	int current_start_retry;
 
 	enum VAD_STATE vad_state;
 	int vad_state_duration; /* ms */
@@ -175,6 +176,7 @@ struct gdf_request {
 	struct timeval session_start; /* log only, no store duration */
 	struct timeval endpointer_end_of_speech_time;
 	struct timeval request_start;
+	struct timeval recognition_initial_attempt;
 	long long last_request_duration_ms;
 	long long last_audio_duration_ms; /* calculated by packet, not clock */
 
@@ -221,6 +223,8 @@ struct gdf_config {
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
 
 	int start_recognition_on_start; /* vs. on speech */
+	int recognition_start_failure_retries;
+	int recognition_start_failure_retry_max_time_ms;
 
 	struct ao2_container *logical_agents;
 	struct ao2_container *hints;
@@ -231,6 +235,7 @@ struct gdf_config {
 		AST_STRING_FIELD(service_key);
 		AST_STRING_FIELD(endpoint);
 		AST_STRING_FIELD(call_log_location);
+		AST_STRING_FIELD(start_failure_retry_codes);
 	);
 };
 
@@ -1132,6 +1137,9 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	char *mulaw;
 	int i;
 	int start_recognition_on_start = 0;
+	int recognition_start_failure_retries = 0;
+	int recognition_start_failure_retry_max_time_ms = 0;
+	const char *start_failure_retry_codes = "";
 	struct gdf_config *cfg;
 	int signal_end_of_speech = 0;
 
@@ -1152,6 +1160,9 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	cfg = gdf_get_config();
 	if (cfg) {
 		start_recognition_on_start = cfg->start_recognition_on_start;
+		recognition_start_failure_retries = cfg->recognition_start_failure_retries;
+		recognition_start_failure_retry_max_time_ms = cfg->recognition_start_failure_retry_max_time_ms;
+		start_failure_retry_codes = ast_strdupa(cfg->start_failure_retry_codes);
 		ao2_t_ref(cfg, -1, "done checking for starting rec on call start");
 	}
 
@@ -1209,11 +1220,42 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 
 	state = df_get_state(req->session);
 	if (state == DF_STATE_READY && start_recognition_on_start) {
+		if (ast_tvzero(req->recognition_initial_attempt)) {
+			req->recognition_initial_attempt = ast_tvnow();
+		}
 		if (df_start_recognition(req->session, req->language, 0, (const char **)req->pvt->hints, req->pvt->hint_count)) {
-			ast_log(LOG_WARNING, "Error starting recognition on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
-			ao2_lock(req);
-			req->state = GDFE_STATE_DONE;
-			ao2_unlock(req);
+			int will_retry = 0;
+			long long retry_duration = ast_tvdiff_ms(ast_tvnow(), req->recognition_initial_attempt);
+			if (req->current_start_retry < recognition_start_failure_retries && retry_duration < recognition_start_failure_retry_max_time_ms) {
+				int results;
+				int result_number;
+				ast_log(LOG_DEBUG, "Error pre-starting recognition on %d@%s -- might retry\n", req->current_utterance_number, req->pvt->session_id);
+				df_stop_recognition(req->session);
+				results = df_get_result_count(req->session);
+				for (result_number = 0; result_number < results; result_number++) {
+					struct dialogflow_result *df_result = df_get_result(req->session, result_number);
+					if (!strcasecmp(df_result->slot, "error_code")) {
+						size_t code_len = strlen(df_result->value);
+						char *comma_code = alloca(code_len + 3);
+
+						sprintf(comma_code, ",%s,", df_result->value);
+						if (strstr(start_failure_retry_codes, comma_code)) {
+							will_retry = 1;
+						}
+						break;
+					}
+				}
+			}
+			if (will_retry) {
+				ast_log(LOG_DEBUG, "Error pre-starting recognition on %d@%s -- will retry\n", req->current_utterance_number, req->pvt->session_id);
+				req->current_start_retry++;
+				vad_state = VAD_STATE_START;
+			} else {
+				ast_log(LOG_WARNING, "Error pre-starting recognition on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
+				ao2_lock(req);
+				req->state = GDFE_STATE_DONE;
+				ao2_unlock(req);
+			}
 		}
 		ao2_lock(req);
 		req->last_audio_duration_ms = 0;
@@ -1229,21 +1271,63 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 
 	state = df_get_state(req->session);
 	if (vad_state != VAD_STATE_START) {
-		if (orig_vad_state == VAD_STATE_START) {
-			if (state == DF_STATE_READY && !start_recognition_on_start) {
+		if (state == DF_STATE_READY) {
+			if (!start_recognition_on_start) {
+				if (ast_tvzero(req->recognition_initial_attempt)) {
+					req->recognition_initial_attempt = ast_tvnow();
+				}
 				if (df_start_recognition(req->session, req->language, 0, (const char **)req->pvt->hints, req->pvt->hint_count)) {
-					state = df_get_state(req->session);
-					ast_log(LOG_WARNING, "Error starting recognition on %d@%s (state is %d)\n", req->current_utterance_number, req->pvt->session_id, state);
-					ao2_lock(req);
-					req->state = GDFE_STATE_DONE;
-					ao2_unlock(req);
+					int will_retry = 0;
+					long long retry_duration = ast_tvdiff_ms(ast_tvnow(), req->recognition_initial_attempt);
+					if (req->current_start_retry < recognition_start_failure_retries && retry_duration < recognition_start_failure_retry_max_time_ms) {
+						int results;
+						int result_number;
+						ast_log(LOG_DEBUG, "Error starting recognition on %d@%s -- might retry\n", req->current_utterance_number, req->pvt->session_id);
+						df_stop_recognition(req->session);
+						results = df_get_result_count(req->session);
+						for (result_number = 0; result_number < results; result_number++) {
+							struct dialogflow_result *df_result = df_get_result(req->session, result_number);
+							if (!strcasecmp(df_result->slot, "error_code")) {
+								size_t code_len = strlen(df_result->value);
+								char *comma_code = alloca(code_len + 3);
+
+								sprintf(comma_code, ",%s,", df_result->value);
+								if (strstr(start_failure_retry_codes, comma_code)) {
+									will_retry = 1;
+								}
+								break;
+							}
+						}
+					}
+					if (will_retry) {
+						size_t new_audio_cache_size;
+						char *new_audio_cache;
+						ast_log(LOG_DEBUG, "Error starting recognition on %d@%s -- will retry\n", req->current_utterance_number, req->pvt->session_id);
+						req->current_start_retry++;
+						coalesce_cached_audio_for_writing(req);
+						new_audio_cache_size = req->mulaw_endpointer_audio_cache_size + 160; /* 20 ms more */
+						new_audio_cache = ast_realloc(req->mulaw_endpointer_audio_cache, new_audio_cache_size);
+						if (new_audio_cache) {
+							req->mulaw_endpointer_audio_cache_size = new_audio_cache_size;
+							req->mulaw_endpointer_audio_cache = new_audio_cache;
+						} else {
+							ast_log(LOG_WARNING, "Unable to resize audio cache for %d@%s -- will lose audio\n", req->current_utterance_number, req->pvt->session_id);
+						}
+					} else {
+						ast_log(LOG_WARNING, "Error starting recognition on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
+						ao2_lock(req);
+						req->state = GDFE_STATE_DONE;
+						ao2_unlock(req);
+					}
 				}
 				ao2_lock(req);
 				req->last_audio_duration_ms = 0;
 				ao2_unlock(req);
 			}
 
-			if (state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
+			state = df_get_state(req->session);
+
+			if (state == DF_STATE_STARTED) {
 				size_t flush_start = 0;
 
 				coalesce_cached_audio_for_writing(req);
@@ -1264,7 +1348,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 				ao2_unlock(req);
 			}
 		}
-		if (state != DF_STATE_FINISHED && state != DF_STATE_ERROR) {
+		if (state == DF_STATE_STARTED) {
 			state = df_write_audio(req->session, mulaw, mulaw_len);
 
 			ao2_lock(req);
@@ -1274,7 +1358,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 
 		ao2_lock(req->pvt);
 		if (req->pvt->current_request == req) {
-			if (req->pvt->speech && !ast_test_flag(req->pvt->speech, AST_SPEECH_SPOKE) && df_get_response_count(req->session) > 0) {
+			if (state == DF_STATE_STARTED && req->pvt->speech && !ast_test_flag(req->pvt->speech, AST_SPEECH_SPOKE) && df_get_response_count(req->session) > 0) {
 				ast_log(LOG_DEBUG, "Setting heard speech on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
 				ast_set_flag(req->pvt->speech, AST_SPEECH_QUIET);
 				ast_set_flag(req->pvt->speech, AST_SPEECH_SPOKE);
@@ -2067,6 +2151,34 @@ static int load_config(int reload)
 			conf->use_internal_endpointer_for_end_of_speech = ast_true(val);
 		}
 		
+		conf->recognition_start_failure_retries = 4;
+		val = ast_variable_retrieve(cfg, "general", "recognition_start_failure_retries");
+		if (!ast_strlen_zero(val)) {
+			int i;
+			if (1 == sscanf(val, "%d", &i)) {
+				conf->recognition_start_failure_retries = i;
+			} else {
+				ast_log(LOG_WARNING, "Invalid value '%s' for recognition_start_failure_retries\n", val);
+			}
+		}
+
+		conf->recognition_start_failure_retry_max_time_ms = 1000;
+		val = ast_variable_retrieve(cfg, "general", "recognition_start_failure_retry_max_time_ms");
+		if (!ast_strlen_zero(val)) {
+			int i;
+			if (1 == sscanf(val, "%d", &i)) {
+				conf->recognition_start_failure_retry_max_time_ms = i;
+			} else {
+				ast_log(LOG_WARNING, "Invalid value '%s' for recognition_start_failure_retry_max_time_ms\n", val);
+			}
+		}
+		
+		ast_string_field_set(conf, start_failure_retry_codes, ",14,");
+		val = ast_variable_retrieve(cfg, "general", "start_failure_retry_codes");
+		if (!ast_strlen_zero(val)) {
+			ast_string_field_build(conf, start_failure_retry_codes, ",%s,", val);
+		}
+
 		if (conf->hints) {
 			val = ast_variable_retrieve(cfg, "general", "hints");
 			if (!ast_strlen_zero(val)) {
@@ -2205,6 +2317,10 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "enable_sentiment_analysis = %s\n", config->enable_sentiment_analysis == SENTIMENT_ANALYSIS_ALWAYS ? "always" :
 																config->enable_sentiment_analysis == SENTIMENT_ANALYSIS_DEFAULT ? "default" : "never");
 			ast_cli(a->fd, "start_recognition_on_start = %s\n", AST_CLI_YESNO(config->start_recognition_on_start));
+			ast_cli(a->fd, "recognition_start_failure_retries = %d\n", config->recognition_start_failure_retries);
+			ast_cli(a->fd, "recognition_start_failure_retry_max_time_ms = %d\n", config->recognition_start_failure_retry_max_time_ms);
+			ast_cli(a->fd, "start_failure_retry_codes = %s\n", config->start_failure_retry_codes);
+			ast_cli(a->fd, "synthesize_fulfillment_text = %s\n", AST_CLI_YESNO(config->synthesize_fulfillment_text));
 			ast_cli(a->fd, "hints = ");
 			h = ao2_iterator_init(config->hints, 0);
 			while ((hint = ao2_iterator_next(&h))) {
