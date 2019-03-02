@@ -138,6 +138,7 @@ struct gdf_pvt {
 		AST_STRING_FIELD(event);
 		AST_STRING_FIELD(language);
 		AST_STRING_FIELD(lastAudioResponse);
+		AST_STRING_FIELD(model);
 
 		AST_STRING_FIELD(call_log_path);
 		AST_STRING_FIELD(call_log_file_basename);
@@ -193,19 +194,23 @@ struct gdf_request {
 		AST_STRING_FIELD(language);
 		AST_STRING_FIELD(pre_recording_filename);
 		AST_STRING_FIELD(post_recording_filename);
+		AST_STRING_FIELD(model);
 	);
 };
 
 struct ao2_container *config;
 
 struct gdf_logical_agent {
-	const char *name;
-	const char *project_id;
-	const char *service_key;
+	AST_DECLARE_STRING_FIELDS(
+		AST_STRING_FIELD(name);
+		AST_STRING_FIELD(project_id);
+		AST_STRING_FIELD(service_key);
+		AST_STRING_FIELD(endpoint);
+		AST_STRING_FIELD(model);
+	);
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
 	int use_internal_endpointer_for_end_of_speech;
 	struct ao2_container *hints;
-	char endpoint[0];
 };
 
 struct gdf_config {
@@ -236,6 +241,7 @@ struct gdf_config {
 		AST_STRING_FIELD(endpoint);
 		AST_STRING_FIELD(call_log_location);
 		AST_STRING_FIELD(start_failure_retry_codes);
+		AST_STRING_FIELD(model);
 	);
 };
 
@@ -398,6 +404,7 @@ static struct gdf_request *create_new_request(struct gdf_pvt *pvt_locked, int ut
 	ast_string_field_set(req, language, pvt_locked->language);
 	ast_string_field_set(req, service_key, pvt_locked->service_key);
 	ast_string_field_set(req, endpoint, pvt_locked->endpoint);
+	ast_string_field_set(req, model, pvt_locked->model);
 
 	req->voice_threshold = pvt_locked->voice_threshold;
 	req->voice_minimum_duration = pvt_locked->voice_minimum_duration;
@@ -557,6 +564,7 @@ static void activate_agent_for_name(struct gdf_pvt *pvt, const char *name, size_
 
 	ao2_lock(pvt);
 	ast_string_field_build(pvt, logical_agent_name, "%.*s", (int) name_len, name);
+	ast_string_field_set(pvt, event, event);
 	ao2_unlock(pvt);
 
 	config = gdf_get_config();
@@ -566,7 +574,7 @@ static void activate_agent_for_name(struct gdf_pvt *pvt, const char *name, size_
 		ast_string_field_set(pvt, project_id, S_OR(logical_agent_map ? logical_agent_map->project_id : NULL, pvt->logical_agent_name));
 		ast_string_field_set(pvt, service_key, S_OR(logical_agent_map ? logical_agent_map->service_key : NULL, config->service_key));
 		ast_string_field_set(pvt, endpoint, S_OR(logical_agent_map ? logical_agent_map->endpoint : NULL, config->endpoint));
-		ast_string_field_set(pvt, event, event);
+		ast_string_field_set(pvt, model, S_OR(logical_agent_map ? logical_agent_map->model : NULL, config->model));
 		calculate_effective_sentiment_analysis_state(pvt, config, logical_agent_map);
 		calculate_effective_hints(pvt, config, logical_agent_map);
 		pvt->use_internal_endpointer_for_end_of_speech = logical_agent_map ? logical_agent_map->use_internal_endpointer_for_end_of_speech : config->use_internal_endpointer_for_end_of_speech;
@@ -578,7 +586,7 @@ static void activate_agent_for_name(struct gdf_pvt *pvt, const char *name, size_
 	} else {
 		ao2_lock(pvt);
 		ast_string_field_set(pvt, project_id, pvt->logical_agent_name);
-		ast_string_field_set(pvt, event, event);
+		ast_string_field_set(pvt, model, "");
 		calculate_effective_sentiment_analysis_state(pvt, NULL, NULL);
 		pvt->use_internal_endpointer_for_end_of_speech = 1;
 		ao2_unlock(pvt);
@@ -1382,6 +1390,7 @@ static int start_dialogflow_recognition(struct gdf_request *req)
 	char *project_id = NULL;
 	char *endpoint = NULL;
 	char *service_key = NULL;
+	char *model = NULL;
 	int request_sentiment_analysis;
 	int use_internal_endpointer_for_end_of_speech;
 	enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state;
@@ -1398,6 +1407,7 @@ static int start_dialogflow_recognition(struct gdf_request *req)
 	project_id = ast_strdupa(req->project_id);
 	endpoint = ast_strdupa(req->endpoint);
 	service_key = ast_strdupa(req->service_key);
+	model = ast_strdupa(req->model);
 	request_sentiment_analysis = req->pvt->request_sentiment_analysis;
 	sentiment_analysis_state = req->pvt->effective_sentiment_analysis_state;
 	use_internal_endpointer_for_end_of_speech = req->pvt->use_internal_endpointer_for_end_of_speech;
@@ -1426,6 +1436,7 @@ static int start_dialogflow_recognition(struct gdf_request *req)
 	ast_log(LOG_DEBUG, "%sequesting sentiment analysis on %d@%s\n", request_sentiment_analysis ? "R" : "Not r", req->current_utterance_number, req->pvt->session_id);
 	df_set_request_sentiment_analysis(req->session, request_sentiment_analysis);
 	df_set_use_external_endpointer(req->session, use_internal_endpointer_for_end_of_speech);
+	df_set_model(req->session, model);
 
 	{
 		char utterance_number[11];
@@ -1856,6 +1867,7 @@ static void logical_agent_destructor(void *obj)
 	if (agent->hints) {
 		ao2_t_ref(agent->hints, -1, "destroying agent");
 	}
+	ast_string_field_free_memory(agent);
 }
 
 static void hint_destructor(void *obj)
@@ -1888,36 +1900,44 @@ static void parse_hints(struct ao2_container *hints, const char *val)
 
 static struct gdf_logical_agent *logical_agent_alloc(const char *name, const char *project_id, 
 	const char *service_key, const char *endpoint, enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state,
-	const char *hints, int use_internal_endpointer_for_end_of_speech)
+	const char *hints, int use_internal_endpointer_for_end_of_speech, const char *model)
 {
 	size_t name_len = strlen(name);
 	size_t project_id_len = strlen(project_id);
 	size_t service_key_len = strlen(service_key);
 	size_t endpoint_len = strlen(endpoint);
+	size_t model_len = strlen(model);
 	size_t space_needed = name_len + 1 +
 							project_id_len + 1 +
 							service_key_len + 1 +
-							endpoint_len + 1;
+							endpoint_len + 1 + 
+							model_len + 1;
 	struct gdf_logical_agent *agent;
 	
-	agent = ao2_alloc(space_needed + sizeof(struct gdf_logical_agent), logical_agent_destructor);
-	if (agent) {
-		ast_copy_string(agent->endpoint, endpoint, endpoint_len + 1);
-		agent->service_key = agent->endpoint + endpoint_len + 1;
-		ast_copy_string((char *)agent->service_key, service_key, service_key_len + 1);
-		agent->project_id = agent->service_key + service_key_len + 1;
-		ast_copy_string((char *)agent->project_id, project_id, project_id_len + 1);
-		agent->name = agent->project_id + project_id_len + 1;
-		ast_copy_string((char *)agent->name, name, name_len + 1);
-		agent->enable_sentiment_analysis = sentiment_analysis_state;
-		agent->use_internal_endpointer_for_end_of_speech = use_internal_endpointer_for_end_of_speech;
-
-		agent->hints = ao2_container_alloc(1, NULL, NULL);
-		if (agent->hints && !ast_strlen_zero(hints)) {
-			parse_hints(agent->hints, hints);
-		}
+	agent = ao2_alloc(sizeof(struct gdf_logical_agent), logical_agent_destructor);
+	if (!agent) {
+		ast_log(LOG_WARNING, "Failed to allocate logical agent for %s\n", name);
+		return NULL;
 	}
 
+	if (ast_string_field_init(agent, space_needed)) {
+		ast_log(LOG_WARNING, "Failed to allocate string fields for logical agent %s\n", name);
+		ao2_t_ref(agent, -1, "Failed to allocate string fields");
+		return NULL;
+	}
+
+	ast_string_field_set(agent, name, name);
+	ast_string_field_set(agent, project_id, project_id);
+	ast_string_field_set(agent, service_key, service_key);
+	ast_string_field_set(agent, endpoint, endpoint);
+	agent->enable_sentiment_analysis = sentiment_analysis_state;
+	agent->use_internal_endpointer_for_end_of_speech = use_internal_endpointer_for_end_of_speech;
+
+	agent->hints = ao2_container_alloc(1, NULL, NULL);
+	if (agent->hints && !ast_strlen_zero(hints)) {
+		parse_hints(agent->hints, hints);
+	}
+	
 	return agent;
 }
 
@@ -2145,7 +2165,7 @@ static int load_config(int reload)
 			conf->synthesize_fulfillment_text = ast_true(val);
 		}
 
-		conf->use_internal_endpointer_for_end_of_speech = 1;
+		conf->use_internal_endpointer_for_end_of_speech = 0;
 		val = ast_variable_retrieve(cfg, "general", "use_internal_endpointer_for_end_of_speech");
 		if (!ast_strlen_zero(val)) {
 			conf->use_internal_endpointer_for_end_of_speech = ast_true(val);
@@ -2179,6 +2199,11 @@ static int load_config(int reload)
 			ast_string_field_build(conf, start_failure_retry_codes, ",%s,", val);
 		}
 
+		val = ast_variable_retrieve(cfg, "general", "model");
+		if (!ast_strlen_zero(val)) {
+			ast_string_field_set(conf, model, val);
+		}
+
 		if (conf->hints) {
 			val = ast_variable_retrieve(cfg, "general", "hints");
 			if (!ast_strlen_zero(val)) {
@@ -2196,6 +2221,7 @@ static int load_config(int reload)
 				const char *enable_sentiment_analysis = ast_variable_retrieve(cfg, category, "enable_sentiment_analysis");
 				const char *hints = ast_variable_retrieve(cfg, category, "hints");
 				const char *use_internal_endpointer_for_end_of_speech_str = ast_variable_retrieve(cfg, category, "use_internal_endpointer_for_end_of_speech");
+				const char *model = ast_variable_retrieve(cfg, category, "model");
 				int use_internal_endpointer_for_end_of_speech;
 				enum SENTIMENT_ANALYSIS_STATE sentiment_analysis_state = SENTIMENT_ANALYSIS_DEFAULT;
 
@@ -2225,7 +2251,8 @@ static int load_config(int reload)
 				if (!ast_strlen_zero(project_id)) {
 					struct gdf_logical_agent *agent;
 					
-					agent = logical_agent_alloc(name, project_id, S_OR(service_key, ""), S_OR(endpoint, ""), sentiment_analysis_state, hints, use_internal_endpointer_for_end_of_speech);
+					agent = logical_agent_alloc(name, project_id, S_OR(service_key, ""), S_OR(endpoint, ""), sentiment_analysis_state, 
+						hints, use_internal_endpointer_for_end_of_speech, S_OR(model, conf->model));
 					if (agent) {
 						ao2_link(conf->logical_agents, agent);
 						ao2_ref(agent, -1);
@@ -2321,6 +2348,8 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "recognition_start_failure_retry_max_time_ms = %d\n", config->recognition_start_failure_retry_max_time_ms);
 			ast_cli(a->fd, "start_failure_retry_codes = %s\n", config->start_failure_retry_codes);
 			ast_cli(a->fd, "synthesize_fulfillment_text = %s\n", AST_CLI_YESNO(config->synthesize_fulfillment_text));
+			ast_cli(a->fd, "model = %s\n", config->model);
+			ast_cli(a->fd, "use_internal_endpointer_for_end_of_speech = %s\n", AST_CLI_YESNO(config->use_internal_endpointer_for_end_of_speech));
 			ast_cli(a->fd, "hints = ");
 			h = ao2_iterator_init(config->hints, 0);
 			while ((hint = ao2_iterator_next(&h))) {
@@ -2335,6 +2364,8 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 				ast_cli(a->fd, "project_id = %s\n", agent->project_id);
 				ast_cli(a->fd, "endpoint = %s\n", agent->endpoint);
 				ast_cli(a->fd, "service_key = %s\n", agent->service_key);
+				ast_cli(a->fd, "model = %s\n", agent->model);
+				ast_cli(a->fd, "use_internal_endpointer_for_end_of_speech = %s\n", AST_CLI_YESNO(agent->use_internal_endpointer_for_end_of_speech));
 				ast_cli(a->fd, "enable_sentiment_analysis = %s\n", agent->enable_sentiment_analysis == SENTIMENT_ANALYSIS_ALWAYS ? "always" :
 																	agent->enable_sentiment_analysis == SENTIMENT_ANALYSIS_DEFAULT ? "default" : "never");
 				ast_cli(a->fd, "hints = ");
