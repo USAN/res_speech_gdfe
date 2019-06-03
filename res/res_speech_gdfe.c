@@ -1146,6 +1146,10 @@ static int gdf_start(struct ast_speech *speech)
 	}
 	pvt->current_request = create_new_request(pvt, pvt->utterance_counter++);
 	ao2_unlock(pvt);
+	if (pvt->current_request == NULL) {
+		ast_speech_change_state(pvt->speech, AST_SPEECH_STATE_DONE);
+		return -1;
+	}
 
 	return 0;
 }
@@ -1510,7 +1514,7 @@ static int start_dialogflow_recognition(struct gdf_request *req)
 			ast_log(LOG_WARNING, "Error recognizing event on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
 			ao2_lock(req->pvt);
 			if (req->pvt->current_request == req && req->pvt->speech) {
-				ast_speech_change_state(req->pvt->speech, AST_SPEECH_STATE_NOT_READY);
+				ast_speech_change_state(req->pvt->speech, AST_SPEECH_STATE_DONE);
 			}
 			req->state = GDFE_STATE_HAVE_RESULTS;
 			ao2_unlock(req->pvt);
