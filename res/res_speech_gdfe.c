@@ -426,6 +426,7 @@ static struct gdf_request *create_new_request(struct gdf_pvt *pvt_locked, int ut
 	req->barge_in_minimum_duration = pvt_locked->barge_in_minimum_duration;
 	req->end_of_speech_minimum_silence = pvt_locked->end_of_speech_minimum_silence;
 	req->session_start = ast_tvnow();
+	req->last_audio_duration_ms = 0;
 
 	if (req->voice_minimum_duration || cfg->endpointer_cache_audio_pretrigger_ms) {
 		size_t cache_needed_size = (req->voice_minimum_duration + cfg->endpointer_cache_audio_pretrigger_ms) * 8; /* bytes per millisecond */
@@ -1834,6 +1835,17 @@ static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
 			}
 		}
 	}
+
+	ao2_lock(pvt);
+	if (pvt->current_request) {
+		char buffer[32];
+		char *b = buffer;
+		size_t l = sizeof(buffer);
+		*b = '\0';
+		ast_build_string(&b, &l, "%lld", pvt->current_request->last_audio_duration_ms);
+		add_speech_result(&start, &end, "waveformDuration", 0, buffer);
+	}
+	ao2_unlock(pvt);
 
 	if (output_audio) { 
 		struct ast_speech_result *new;
