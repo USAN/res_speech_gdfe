@@ -1776,6 +1776,24 @@ static int gdf_change_results_type(struct ast_speech *speech, enum ast_speech_re
 	return 0;
 }
 
+static void add_speech_result(struct ast_speech_result **start, struct ast_speech_result **end, 
+	const char *grammar, int score, const char *text)
+{
+	struct ast_speech_result *new = ast_calloc(1, sizeof(*new));
+	if (new) {
+		new->text = ast_strdup(text);
+		new->score = score;
+		new->grammar = ast_strdup(grammar);
+	}
+
+	if (*end) {
+		AST_LIST_NEXT(*end, list) = new;
+		*end = new;
+	} else {
+		*start = *end = new;
+	}
+}
+
 static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
 {
 	/* speech is not locked */
@@ -1808,22 +1826,10 @@ static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
 				/* this is fine for now, but we really need a flag on the structure that says it's binary vs. text */
 				output_audio = df_result;
 			} else {
-				struct ast_speech_result *new = ast_calloc(1, sizeof(*new));
-				if (new) {
-					new->text = ast_strdup(df_result->value);
-					new->score = df_result->score;
-					new->grammar = ast_strdup(df_result->slot);
+				add_speech_result(&start, &end, df_result->slot, df_result->score, df_result->value);
 
-					if (!strcasecmp(df_result->slot, "fulfillment_text")) {
-						fulfillment_text = df_result;
-					}
-				}
-
-				if (end) {
-					AST_LIST_NEXT(end, list) = new;
-					end = new;
-				} else {
-					start = end = new;
+				if (!strcasecmp(df_result->slot, "fulfillment_text")) {
+					fulfillment_text = df_result;
 				}
 			}
 		}
