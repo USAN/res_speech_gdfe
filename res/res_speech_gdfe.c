@@ -78,13 +78,18 @@
 #define VAD_PROP_VOICE_THRESHOLD	"voice_threshold"
 #define VAD_PROP_VOICE_DURATION		"voice_duration"
 #define VAD_PROP_SILENCE_DURATION	"silence_duration"
+#define VAD_PROP_BARGE_DURATION		"barge_duration"
+#define VAD_PROP_END_OF_SPEECH_DURATION	"end_of_speech_duration"
 
 #define GDF_PROP_UTTERANCE_DURATION_MS	"utterance_duration_ms"
+
+typedef int milliseconds_t;
 
 enum VAD_STATE {
 	VAD_STATE_START,
 	VAD_STATE_SPEAK,
-	VAD_STATE_SILENT
+	VAD_STATE_SILENT,
+	VAD_STATE_END,
 };
 
 enum SENTIMENT_ANALYSIS_STATE {
@@ -105,12 +110,14 @@ struct gdf_request;
 struct gdf_pvt {
 	struct ast_speech *speech;
 	
-	int vad_state_duration; /* ms */
-	int vad_change_duration; /* ms -- cumulative time of "not current state" audio */
+	milliseconds_t vad_state_duration;
+	milliseconds_t vad_change_duration; /* cumulative time of "not current state" audio */
 
 	int voice_threshold; /* 0 - (2^16 - 1) */
-	int voice_minimum_duration; /* ms */
-	int silence_minimum_duration; /* ms */
+	milliseconds_t voice_minimum_duration;
+	milliseconds_t silence_minimum_duration;
+	milliseconds_t barge_in_minimum_duration;
+	milliseconds_t end_of_speech_minimum_silence;
 
 	int call_log_open_already_attempted;
 	FILE *call_log_file_handle;
@@ -155,12 +162,15 @@ struct gdf_request {
 	int current_start_retry;
 
 	enum VAD_STATE vad_state;
-	int vad_state_duration; /* ms */
-	int vad_change_duration; /* ms -- cumulative time of "not current state" audio */
+	milliseconds_t vad_state_duration;
+	milliseconds_t vad_change_duration; /* cumulative time of "not current state" audio */
 
 	int voice_threshold; /* 0 - (2^16 - 1) */
-	int voice_minimum_duration; /* ms */
-	int silence_minimum_duration; /* ms */
+	int heard_speech;
+	milliseconds_t voice_minimum_duration;
+	milliseconds_t silence_minimum_duration;
+	milliseconds_t barge_in_minimum_duration;
+	milliseconds_t end_of_speech_minimum_silence;
 
 	int record_utterance;
 
@@ -178,6 +188,8 @@ struct gdf_request {
 	struct timeval endpointer_end_of_speech_time;
 	struct timeval request_start;
 	struct timeval recognition_initial_attempt;
+	struct timeval endpointer_barge_in_time;
+	struct timeval dialogflow_barge_in_time;
 	long long last_request_duration_ms;
 	long long last_audio_duration_ms; /* calculated by packet, not clock */
 
@@ -215,10 +227,12 @@ struct gdf_logical_agent {
 
 struct gdf_config {
 	int vad_voice_threshold;
-	int vad_voice_minimum_duration;
-	int vad_silence_minimum_duration;
+	milliseconds_t vad_voice_minimum_duration;
+	milliseconds_t vad_silence_minimum_duration;
+	milliseconds_t vad_barge_minimum_duration;
+	milliseconds_t vad_end_of_speech_silence_duration;
 
-	int endpointer_cache_audio_pretrigger_ms;
+	milliseconds_t endpointer_cache_audio_pretrigger_ms;
 
 	int enable_call_logs;
 	int enable_preendpointer_recordings;
@@ -347,6 +361,8 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	pvt->voice_threshold = cfg->vad_voice_threshold;
 	pvt->voice_minimum_duration = cfg->vad_voice_minimum_duration;
 	pvt->silence_minimum_duration = cfg->vad_silence_minimum_duration;
+	pvt->barge_in_minimum_duration = cfg->vad_barge_minimum_duration;
+	pvt->end_of_speech_minimum_silence = cfg->vad_end_of_speech_silence_duration;
 	pvt->session_start = ast_tvnow();
 	ast_string_field_set(pvt, call_logging_application_name, "unknown");
 	pvt->speech = speech;
@@ -409,7 +425,10 @@ static struct gdf_request *create_new_request(struct gdf_pvt *pvt_locked, int ut
 	req->voice_threshold = pvt_locked->voice_threshold;
 	req->voice_minimum_duration = pvt_locked->voice_minimum_duration;
 	req->silence_minimum_duration = pvt_locked->silence_minimum_duration;
+	req->barge_in_minimum_duration = pvt_locked->barge_in_minimum_duration;
+	req->end_of_speech_minimum_silence = pvt_locked->end_of_speech_minimum_silence;
 	req->session_start = ast_tvnow();
+	req->last_audio_duration_ms = 0;
 
 	if (req->voice_minimum_duration || cfg->endpointer_cache_audio_pretrigger_ms) {
 		size_t cache_needed_size = (req->voice_minimum_duration + cfg->endpointer_cache_audio_pretrigger_ms) * 8; /* bytes per millisecond */
@@ -654,13 +673,24 @@ static int calculate_audio_level(const short *slin, int len)
 	return sum / len;
 }
 
+static long long tvdiff_ms_or_zero(struct timeval end, struct timeval start)
+{
+	if (ast_tvzero(end) || ast_tvzero(start)) {
+		return 0;
+	} else {
+		return ast_tvdiff_ms(end, start);
+	}
+}
+
 static void write_end_of_recognition_call_event(struct gdf_request *req)
 {
-	char duration_buffer[21] = "";
-	char utterance_duration_buffer[21] = "";
-	char speech_rec_duration_buffer[21] = "";
-	char dialogflow_response_time_buffer[21] = "";
-	char intent_latency_time_buffer[21] = "";
+	char duration_buffer[32] = "";
+	char utterance_duration_buffer[32] = "";
+	char speech_rec_duration_buffer[32] = "";
+	char dialogflow_response_time_buffer[32] = "";
+	char intent_latency_time_buffer[32] = "";
+	char endpointer_barge_in_time_buffer[32] = "";
+	char dialogflow_barge_in_time_buffer[32] = "";
 	struct timeval dialogflow_start_time = df_get_session_start_time(req->session);
 	struct timeval last_transcription_time = df_get_session_last_transcription_time(req->session);
 	struct timeval intent_detect_time = df_get_session_intent_detected_time(req->session);
@@ -670,15 +700,19 @@ static void write_end_of_recognition_call_event(struct gdf_request *req)
 		{ "speech_rec_duration_ms", speech_rec_duration_buffer },
 		{ "dialogflow_response_time_ms", dialogflow_response_time_buffer },
 		{ "intent_latency_time_ms", intent_latency_time_buffer },
+		{ "endpointer_barge_in_ms", endpointer_barge_in_time_buffer },
+		{ "dialogflow_barge_in_ms", dialogflow_barge_in_time_buffer },
 		{ "pre_recording", req->pre_recording_filename },
 		{ "post_recording", req->post_recording_filename }
 	};
 
 	sprintf(duration_buffer, "%lld", req->last_request_duration_ms);
 	sprintf(utterance_duration_buffer, "%lld", req->last_audio_duration_ms);
-	sprintf(speech_rec_duration_buffer, "%lld", (long long) ast_tvdiff_ms(last_transcription_time, dialogflow_start_time));
-	sprintf(dialogflow_response_time_buffer, "%lld", (long long) ast_tvdiff_ms(intent_detect_time, last_transcription_time));
-	sprintf(intent_latency_time_buffer, "%lld", (long long) ast_tvdiff_ms(intent_detect_time, req->endpointer_end_of_speech_time));
+	sprintf(speech_rec_duration_buffer, "%lld", tvdiff_ms_or_zero(last_transcription_time, dialogflow_start_time));
+	sprintf(dialogflow_response_time_buffer, "%lld", tvdiff_ms_or_zero(intent_detect_time, last_transcription_time));
+	sprintf(intent_latency_time_buffer, "%lld", tvdiff_ms_or_zero(intent_detect_time, req->endpointer_end_of_speech_time));
+	sprintf(endpointer_barge_in_time_buffer, "%lld", tvdiff_ms_or_zero(req->endpointer_barge_in_time, req->request_start));
+	sprintf(dialogflow_barge_in_time_buffer, "%lld", tvdiff_ms_or_zero(req->dialogflow_barge_in_time, req->request_start));
 
 	gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_RECOGNITION, "stop", ARRAY_LEN(log_data), log_data);
 }
@@ -1096,15 +1130,21 @@ static void log_endpointer_start_event(struct gdf_request *req)
 	char threshold[11];
 	char voice_duration[11];
 	char silence_duration[11];
+	char barge_duration[11];
+	char end_of_speech_duration[11];
 	struct dialogflow_log_data log_data[] = {
 		{ VAD_PROP_VOICE_THRESHOLD, threshold },
 		{ VAD_PROP_VOICE_DURATION, voice_duration },
 		{ VAD_PROP_SILENCE_DURATION, silence_duration },
+		{ VAD_PROP_BARGE_DURATION, barge_duration },
+		{ VAD_PROP_END_OF_SPEECH_DURATION, end_of_speech_duration }
 	};
 
 	sprintf(threshold, "%d", req->voice_threshold);
 	sprintf(voice_duration, "%d", req->voice_minimum_duration);
 	sprintf(silence_duration, "%d", req->silence_minimum_duration);
+	sprintf(barge_duration, "%d", req->barge_in_minimum_duration);
+	sprintf(end_of_speech_duration, "%d", req->end_of_speech_minimum_silence);
 
 	gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "start", ARRAY_LEN(log_data), log_data);
 }
@@ -1124,8 +1164,25 @@ static int gdf_start(struct ast_speech *speech)
 	}
 	pvt->current_request = create_new_request(pvt, pvt->utterance_counter++);
 	ao2_unlock(pvt);
+	if (pvt->current_request == NULL) {
+		ast_speech_change_state(pvt->speech, AST_SPEECH_STATE_DONE);
+		return -1;
+	}
 
 	return 0;
+}
+
+static void maybe_signal_speaking(struct gdf_request *req, enum dialogflow_session_state state)
+{
+	ao2_lock(req->pvt);
+	if (req->pvt->current_request == req) {
+		if (state == DF_STATE_STARTED && req->pvt->speech && !ast_test_flag(req->pvt->speech, AST_SPEECH_SPOKE)) {
+			ast_log(LOG_DEBUG, "Setting heard speech on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
+			ast_set_flag(req->pvt->speech, AST_SPEECH_QUIET);
+			ast_set_flag(req->pvt->speech, AST_SPEECH_SPOKE);
+		}
+	}
+	ao2_unlock(req->pvt);
 }
 
 static int write_audio_frame(struct gdf_request *req, void *data, int len)
@@ -1139,6 +1196,9 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	int avg_level;
 	int voice_duration;
 	int silence_duration;
+	int barge_duration;
+	int end_of_speech_duration;
+	int heard_speech;
 	int datasamples;
 	int datams;
 	int mulaw_len;
@@ -1163,6 +1223,9 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	change_duration = req->vad_change_duration;
 	voice_duration = req->voice_minimum_duration;
 	silence_duration = req->silence_minimum_duration;
+	barge_duration = req->barge_in_minimum_duration;
+	end_of_speech_duration = req->end_of_speech_minimum_silence;
+	heard_speech = req->heard_speech;
 	ao2_unlock(req);
 
 	cfg = gdf_get_config();
@@ -1173,6 +1236,8 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 		start_failure_retry_codes = ast_strdupa(cfg->start_failure_retry_codes);
 		ao2_t_ref(cfg, -1, "done checking for starting rec on call start");
 	}
+
+	state = df_get_state(req->session);
 
 	cur_duration += datams;
 
@@ -1195,17 +1260,32 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 		if (change_duration >= voice_duration) {
 			/* speaking */
 			vad_state = VAD_STATE_SPEAK;
+			cur_duration = change_duration;
 			change_duration = 0;
-			cur_duration = 0;
 			gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "start_of_speech");
 		}
 	} else if (vad_state == VAD_STATE_SPEAK) {
 		if (change_duration >= silence_duration) {
-			/* stopped speaking */
-			/* noop at this time */
 			vad_state = VAD_STATE_SILENT;
+			cur_duration = change_duration;
 			change_duration = 0;
-			cur_duration = 0;
+		} else if (cur_duration >= barge_duration) {
+			if (!heard_speech) {
+				heard_speech = 1;
+				gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "barge_in");
+				maybe_signal_speaking(req, state);
+			}
+			if (ast_tvzero(req->endpointer_barge_in_time)) {
+				req->endpointer_barge_in_time = ast_tvnow();
+			}
+		}
+	} else if (vad_state == VAD_STATE_SILENT) {
+		if (change_duration >= voice_duration) {
+			vad_state = VAD_STATE_SPEAK;
+			cur_duration = change_duration;
+			change_duration = 0;
+		} else if (heard_speech && cur_duration >= end_of_speech_duration) {
+			vad_state = VAD_STATE_END;
 			gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "end_of_speech");
 			ao2_lock(req);
 			req->endpointer_end_of_speech_time = ast_tvnow();
@@ -1213,11 +1293,12 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 			ao2_unlock(req);
 		}
 	}
-
+	
 	ao2_lock(req);
 	req->vad_state = vad_state;
 	req->vad_state_duration = cur_duration;
 	req->vad_change_duration = change_duration;
+	req->heard_speech = heard_speech;
 	ao2_unlock(req);
 
 #ifdef RES_SPEECH_GDFE_DEBUG_VAD
@@ -1226,7 +1307,6 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 		orig_vad_state, vad_state);
 #endif
 
-	state = df_get_state(req->session);
 	if (state == DF_STATE_READY && start_recognition_on_start) {
 		if (ast_tvzero(req->recognition_initial_attempt)) {
 			req->recognition_initial_attempt = ast_tvnow();
@@ -1356,23 +1436,24 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 				ao2_unlock(req);
 			}
 		}
+
 		if (state == DF_STATE_STARTED) {
 			state = df_write_audio(req->session, mulaw, mulaw_len);
 
+			if (!heard_speech && df_get_response_count(req->session) > 0) {
+				heard_speech = 1;
+				gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "auto_barge_in");
+				maybe_signal_speaking(req, state);
+			}
+			if (ast_tvzero(req->dialogflow_barge_in_time) && df_get_response_count(req->session) > 0) {
+				req->dialogflow_barge_in_time = ast_tvnow();
+			}
+
 			ao2_lock(req);
 			req->last_audio_duration_ms += mulaw_len / 8;
+			req->heard_speech = heard_speech;
 			ao2_unlock(req);
 		}
-
-		ao2_lock(req->pvt);
-		if (req->pvt->current_request == req) {
-			if (state == DF_STATE_STARTED && req->pvt->speech && !ast_test_flag(req->pvt->speech, AST_SPEECH_SPOKE) && df_get_response_count(req->session) > 0) {
-				ast_log(LOG_DEBUG, "Setting heard speech on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
-				ast_set_flag(req->pvt->speech, AST_SPEECH_QUIET);
-				ast_set_flag(req->pvt->speech, AST_SPEECH_SPOKE);
-			}
-		}
-		ao2_unlock(req->pvt);
 	}
  	if (signal_end_of_speech || state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
 		ao2_lock(req);
@@ -1459,7 +1540,7 @@ static int start_dialogflow_recognition(struct gdf_request *req)
 			ast_log(LOG_WARNING, "Error recognizing event on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
 			ao2_lock(req->pvt);
 			if (req->pvt->current_request == req && req->pvt->speech) {
-				ast_speech_change_state(req->pvt->speech, AST_SPEECH_STATE_NOT_READY);
+				ast_speech_change_state(req->pvt->speech, AST_SPEECH_STATE_DONE);
 			}
 			req->state = GDFE_STATE_HAVE_RESULTS;
 			ao2_unlock(req->pvt);
@@ -1608,13 +1689,40 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 			ast_log(LOG_WARNING, "Invalid value for " VAD_PROP_SILENCE_DURATION " -- '%s'\n", value);
 			return -1;
 		}
+	} else if (!strcasecmp(name, VAD_PROP_BARGE_DURATION)) {
+		int i;
+		if (ast_strlen_zero(value)) {
+			ast_log(LOG_WARNING, "Cannot set " VAD_PROP_BARGE_DURATION " to an empty value\n");
+			return -1;
+		} else if (sscanf(value, "%d", &i) == 1) {
+			ao2_lock(pvt);
+			pvt->barge_in_minimum_duration = i;
+			ao2_unlock(pvt);
+		} else {
+			ast_log(LOG_WARNING, "Invalid value for " VAD_PROP_BARGE_DURATION " -- '%s'\n", value);
+			return -1;
+		}
+	} else if (!strcasecmp(name, VAD_PROP_END_OF_SPEECH_DURATION)) {
+		int i;
+		if (ast_strlen_zero(value)) {
+			ast_log(LOG_WARNING, "Cannot set " VAD_PROP_END_OF_SPEECH_DURATION " to an empty value\n");
+			return -1;
+		} else if (sscanf(value, "%d", &i) == 1) {
+			ao2_lock(pvt);
+			pvt->end_of_speech_minimum_silence = i;
+			ao2_unlock(pvt);
+		} else {
+			ast_log(LOG_WARNING, "Invalid value for " VAD_PROP_END_OF_SPEECH_DURATION " -- '%s'\n", value);
+			return -1;
+		}
 	} else if (!strcasecmp(name, GDF_PROP_REQUEST_SENTIMENT_ANALYSIS)) {
 		ao2_lock(pvt);
 		pvt->request_sentiment_analysis = ast_true(value);
 		ao2_unlock(pvt);
 	} else if (!strcasecmp(name, "logPromptStart")) {
 		struct dialogflow_log_data log_data[] = {
-			{ "prompt", S_OR(value, "") }
+			{ "context", pvt->call_logging_context },
+			{ "prompt", S_OR(value, "") }			
 		};
 		gdf_log_call_event(pvt, pvt->current_request, CALL_LOG_TYPE_RECOGNITION, "prompt_start", ARRAY_LEN(log_data), log_data);
 	} else if (!strcasecmp(name, "logPromptStop")) {
@@ -1672,6 +1780,14 @@ static int gdf_get_setting(struct ast_speech *speech, const char *name, char *bu
 		ao2_lock(pvt);
 		ast_build_string(&buf, &len, "%d", pvt->silence_minimum_duration);
 		ao2_unlock(pvt);
+	} else if (!strcasecmp(name, VAD_PROP_BARGE_DURATION)) {
+		ao2_lock(pvt);
+		ast_build_string(&buf, &len, "%d", pvt->barge_in_minimum_duration);
+		ao2_unlock(pvt);
+	} else if (!strcasecmp(name, VAD_PROP_END_OF_SPEECH_DURATION)) {
+		ao2_lock(pvt);
+		ast_build_string(&buf, &len, "%d", pvt->end_of_speech_minimum_silence);
+		ao2_unlock(pvt);
 	} else {
 		ast_log(LOG_WARNING, "Unknown property '%s'\n", name);
 		return -1;
@@ -1684,6 +1800,24 @@ static int gdf_get_setting(struct ast_speech *speech, const char *name, char *bu
 static int gdf_change_results_type(struct ast_speech *speech, enum ast_speech_results_type results_type)
 {
 	return 0;
+}
+
+static void add_speech_result(struct ast_speech_result **start, struct ast_speech_result **end, 
+	const char *grammar, int score, const char *text)
+{
+	struct ast_speech_result *new = ast_calloc(1, sizeof(*new));
+	if (new) {
+		new->text = ast_strdup(text);
+		new->score = score;
+		new->grammar = ast_strdup(grammar);
+	}
+
+	if (*end) {
+		AST_LIST_NEXT(*end, list) = new;
+		*end = new;
+	} else {
+		*start = *end = new;
+	}
 }
 
 static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
@@ -1718,26 +1852,25 @@ static struct ast_speech_result *gdf_get_results(struct ast_speech *speech)
 				/* this is fine for now, but we really need a flag on the structure that says it's binary vs. text */
 				output_audio = df_result;
 			} else {
-				struct ast_speech_result *new = ast_calloc(1, sizeof(*new));
-				if (new) {
-					new->text = ast_strdup(df_result->value);
-					new->score = df_result->score;
-					new->grammar = ast_strdup(df_result->slot);
+				add_speech_result(&start, &end, df_result->slot, df_result->score, df_result->value);
 
-					if (!strcasecmp(df_result->slot, "fulfillment_text")) {
-						fulfillment_text = df_result;
-					}
-				}
-
-				if (end) {
-					AST_LIST_NEXT(end, list) = new;
-					end = new;
-				} else {
-					start = end = new;
+				if (!strcasecmp(df_result->slot, "fulfillment_text")) {
+					fulfillment_text = df_result;
 				}
 			}
 		}
 	}
+
+	ao2_lock(pvt);
+	if (pvt->current_request) {
+		char buffer[32];
+		char *b = buffer;
+		size_t l = sizeof(buffer);
+		*b = '\0';
+		ast_build_string(&b, &l, "%lld", pvt->current_request->last_audio_duration_ms);
+		add_speech_result(&start, &end, "waveformDuration", 0, buffer);
+	}
+	ao2_unlock(pvt);
 
 	if (output_audio) { 
 		struct ast_speech_result *new;
@@ -2080,7 +2213,7 @@ static int load_config(int reload)
 			}
 		}
 
-		conf->vad_silence_minimum_duration = 500; /* ms */
+		conf->vad_silence_minimum_duration = 100; /* ms */
 		val = ast_variable_retrieve(cfg, "general", "vad_silence_minimum_duration");
 		if (!ast_strlen_zero(val)) {
 			int i;
@@ -2091,6 +2224,34 @@ static int load_config(int reload)
 				conf->vad_silence_minimum_duration = i;
 			} else {
 				ast_log(LOG_WARNING, "Invalid value for vad_silence_minimum_duration\n");
+			}
+		}
+
+		conf->vad_barge_minimum_duration = 300; /* ms */
+		val = ast_variable_retrieve(cfg, "general", "vad_barge_minimum_duration");
+		if (!ast_strlen_zero(val)) {
+			int i;
+			if (sscanf(val, "%d", &i) == 1) {
+				if ((i % 20) != 0) {
+					i = ((i / 20) + 1) * 20;
+				}
+				conf->vad_barge_minimum_duration = i;
+			} else {
+				ast_log(LOG_WARNING, "Invalid value for vad_barge_minimum_duration\n");
+			}
+		}
+
+		conf->vad_end_of_speech_silence_duration = 500; /* ms */
+		val = ast_variable_retrieve(cfg, "general", "vad_end_of_speech_silence_duration");
+		if (!ast_strlen_zero(val)) {
+			int i;
+			if (sscanf(val, "%d", &i) == 1) {
+				if ((i % 20) != 0) {
+					i = ((i / 20) + 1) * 20;
+				}
+				conf->vad_end_of_speech_silence_duration = i;
+			} else {
+				ast_log(LOG_WARNING, "Invalid value for vad_end_of_speech_silence_duration\n");
 			}
 		}
 
@@ -2335,6 +2496,8 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "vad_voice_threshold = %d\n", config->vad_voice_threshold);
 			ast_cli(a->fd, "vad_voice_minimum_duration = %d\n", config->vad_voice_minimum_duration);
 			ast_cli(a->fd, "vad_silence_minimum_duration = %d\n", config->vad_silence_minimum_duration);
+			ast_cli(a->fd, "vad_barge_minimum_duration = %d\n", config->vad_barge_minimum_duration);
+			ast_cli(a->fd, "vad_end_of_speech_silence_duration = %d\n", config->vad_end_of_speech_silence_duration);
 			ast_cli(a->fd, "endpointer_cache_audio_pretrigger_ms = %d\n", config->endpointer_cache_audio_pretrigger_ms);
 			ast_cli(a->fd, "call_log_location = %s\n", config->call_log_location);
 			ast_cli(a->fd, "enable_call_logs = %s\n", AST_CLI_YESNO(config->enable_call_logs));
