@@ -188,6 +188,8 @@ struct gdf_request {
 	struct timeval endpointer_end_of_speech_time;
 	struct timeval request_start;
 	struct timeval recognition_initial_attempt;
+	struct timeval endpointer_barge_in_time;
+	struct timeval dialogflow_barge_in_time;
 	long long last_request_duration_ms;
 	long long last_audio_duration_ms; /* calculated by packet, not clock */
 
@@ -671,13 +673,24 @@ static int calculate_audio_level(const short *slin, int len)
 	return sum / len;
 }
 
+static long long tvdiff_ms_or_zero(struct timeval end, struct timeval start)
+{
+	if (ast_tvzero(end) || ast_tvzero(start)) {
+		return 0;
+	} else {
+		return ast_tvdiff_ms(end, start);
+	}
+}
+
 static void write_end_of_recognition_call_event(struct gdf_request *req)
 {
-	char duration_buffer[21] = "";
-	char utterance_duration_buffer[21] = "";
-	char speech_rec_duration_buffer[21] = "";
-	char dialogflow_response_time_buffer[21] = "";
-	char intent_latency_time_buffer[21] = "";
+	char duration_buffer[32] = "";
+	char utterance_duration_buffer[32] = "";
+	char speech_rec_duration_buffer[32] = "";
+	char dialogflow_response_time_buffer[32] = "";
+	char intent_latency_time_buffer[32] = "";
+	char endpointer_barge_in_time_buffer[32] = "";
+	char dialogflow_barge_in_time_buffer[32] = "";
 	struct timeval dialogflow_start_time = df_get_session_start_time(req->session);
 	struct timeval last_transcription_time = df_get_session_last_transcription_time(req->session);
 	struct timeval intent_detect_time = df_get_session_intent_detected_time(req->session);
@@ -687,15 +700,19 @@ static void write_end_of_recognition_call_event(struct gdf_request *req)
 		{ "speech_rec_duration_ms", speech_rec_duration_buffer },
 		{ "dialogflow_response_time_ms", dialogflow_response_time_buffer },
 		{ "intent_latency_time_ms", intent_latency_time_buffer },
+		{ "endpointer_barge_in_ms", endpointer_barge_in_time_buffer },
+		{ "dialogflow_barge_in_ms", dialogflow_barge_in_time_buffer },
 		{ "pre_recording", req->pre_recording_filename },
 		{ "post_recording", req->post_recording_filename }
 	};
 
 	sprintf(duration_buffer, "%lld", req->last_request_duration_ms);
 	sprintf(utterance_duration_buffer, "%lld", req->last_audio_duration_ms);
-	sprintf(speech_rec_duration_buffer, "%lld", (long long) ast_tvdiff_ms(last_transcription_time, dialogflow_start_time));
-	sprintf(dialogflow_response_time_buffer, "%lld", (long long) ast_tvdiff_ms(intent_detect_time, last_transcription_time));
-	sprintf(intent_latency_time_buffer, "%lld", (long long) ast_tvdiff_ms(intent_detect_time, req->endpointer_end_of_speech_time));
+	sprintf(speech_rec_duration_buffer, "%lld", tvdiff_ms_or_zero(last_transcription_time, dialogflow_start_time));
+	sprintf(dialogflow_response_time_buffer, "%lld", tvdiff_ms_or_zero(intent_detect_time, last_transcription_time));
+	sprintf(intent_latency_time_buffer, "%lld", tvdiff_ms_or_zero(intent_detect_time, req->endpointer_end_of_speech_time));
+	sprintf(endpointer_barge_in_time_buffer, "%lld", tvdiff_ms_or_zero(req->endpointer_barge_in_time, req->request_start));
+	sprintf(dialogflow_barge_in_time_buffer, "%lld", tvdiff_ms_or_zero(req->dialogflow_barge_in_time, req->request_start));
 
 	gdf_log_call_event(req->pvt, req, CALL_LOG_TYPE_RECOGNITION, "stop", ARRAY_LEN(log_data), log_data);
 }
@@ -1252,10 +1269,15 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 			vad_state = VAD_STATE_SILENT;
 			cur_duration = change_duration;
 			change_duration = 0;
-		} else if (!heard_speech && cur_duration >= barge_duration) {
-			heard_speech = 1;
-			gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "barge_in");
-			maybe_signal_speaking(req, state);
+		} else if (cur_duration >= barge_duration) {
+			if (!heard_speech) {
+				heard_speech = 1;
+				gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "barge_in");
+				maybe_signal_speaking(req, state);
+			}
+			if (ast_tvzero(req->endpointer_barge_in_time)) {
+				req->endpointer_barge_in_time = ast_tvnow();
+			}
 		}
 	} else if (vad_state == VAD_STATE_SILENT) {
 		if (change_duration >= voice_duration) {
@@ -1422,6 +1444,9 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 				heard_speech = 1;
 				gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "auto_barge_in");
 				maybe_signal_speaking(req, state);
+			}
+			if (ast_tvzero(req->dialogflow_barge_in_time) && df_get_response_count(req->session) > 0) {
+				req->dialogflow_barge_in_time = ast_tvnow();
 			}
 
 			ao2_lock(req);
