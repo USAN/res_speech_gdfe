@@ -956,11 +956,6 @@ static int gdf_stop_recognition(struct gdf_request *req)
 	return 0;
 }
 
-static int gdf_state_changed(struct ast_speech *speech, int old_state, int new_state)
-{
-	return 0;
-}
-
 /* speech structure is locked */
 static int gdf_write(struct ast_speech *speech, void *data, int len)
 {
@@ -972,7 +967,11 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	memset(&f, 0, sizeof(f));
 	
 	f.frametype = AST_FRAME_VOICE;
+#ifdef ASTERISK_13_OR_LATER
+	f.subclass.format = ast_format_slin;
+#else
 	f.subclass.codec = AST_FORMAT_SLINEAR;
+#endif
 	f.data.ptr = data;
 	f.datalen = len;
 	f.samples = len / 2;
@@ -1189,7 +1188,9 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 {
 	enum dialogflow_session_state state;
 	enum VAD_STATE vad_state;
+#ifdef RES_SPEECH_GDFE_DEBUG_VAD
 	enum VAD_STATE orig_vad_state;
+#endif
 	int threshold;
 	int cur_duration;
 	int change_duration;
@@ -1217,7 +1218,10 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	mulaw = alloca(mulaw_len);
 
 	ao2_lock(req);
-	orig_vad_state = vad_state = req->vad_state;
+#ifdef RES_SPEECH_GDFE_DEBUG_VAD
+	orig_vad_state = req->vad_state;
+#endif
+	vad_state = req->vad_state;
 	threshold = req->voice_threshold;
 	cur_duration = req->vad_state_duration;
 	change_duration = req->vad_change_duration;
@@ -2626,7 +2630,7 @@ static void gdf_log_call_event(struct gdf_pvt *pvt, struct gdf_request *req, enu
 			RAII_VAR(struct ast_json *, array, ast_json_array_create(), ast_json_unref);
 
 			for (j = 0; j < log_data[i].value_count; j++) {
-				ast_json_array_append(log_message, json_string(((const char **)log_data[i].value)[j]));
+				ast_json_array_append(log_message, ast_json_string_create(((const char **)log_data[i].value)[j]));
 			}
 			ast_json_object_set(log_message, log_data[i].name, ast_json_ref(array));
 		}
@@ -2713,9 +2717,9 @@ static struct ast_speech_engine gdf_engine = {
 #endif
 	.change_results_type = gdf_change_results_type,
 	.get = gdf_get_results,
-	.state_changed = gdf_state_changed
 };
 
+#ifndef ASTERISK_13_OR_LATER
 static void *json_custom_malloc(size_t sz)
 {
 	return ast_malloc(sz);
@@ -2724,13 +2728,16 @@ static void json_custom_free(void *ptr)
 {
 	ast_free(ptr);
 }
+#endif
 
 #pragma GCC diagnostic ignored "-Wmissing-format-attribute"
 static enum ast_module_load_result load_module(void)
 {
 	struct gdf_config *cfg;
 
+#ifndef ASTERISK_13_OR_LATER
 	json_set_alloc_funcs(json_custom_malloc, json_custom_free);
+#endif
 
 	config = ao2_container_alloc(1, NULL, NULL);
 	if (!config) {
