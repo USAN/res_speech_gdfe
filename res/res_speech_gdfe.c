@@ -119,6 +119,9 @@ struct gdf_pvt {
 	milliseconds_t barge_in_minimum_duration;
 	milliseconds_t end_of_speech_minimum_silence;
 
+	milliseconds_t incomplete_timeout;
+	milliseconds_t no_speech_timeout;
+
 	int call_log_open_already_attempted;
 	FILE *call_log_file_handle;
 
@@ -171,6 +174,9 @@ struct gdf_request {
 	milliseconds_t silence_minimum_duration;
 	milliseconds_t barge_in_minimum_duration;
 	milliseconds_t end_of_speech_minimum_silence;
+
+	milliseconds_t incomplete_timeout;
+	milliseconds_t no_speech_timeout;
 
 	int record_utterance;
 
@@ -233,6 +239,9 @@ struct gdf_config {
 	milliseconds_t vad_end_of_speech_silence_duration;
 
 	milliseconds_t endpointer_cache_audio_pretrigger_ms;
+
+	milliseconds_t default_incomplete_timeout;
+	milliseconds_t default_no_speech_timeout;
 
 	int enable_call_logs;
 	int enable_preendpointer_recordings;
@@ -364,6 +373,8 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	pvt->barge_in_minimum_duration = cfg->vad_barge_minimum_duration;
 	pvt->end_of_speech_minimum_silence = cfg->vad_end_of_speech_silence_duration;
 	pvt->session_start = ast_tvnow();
+	pvt->incomplete_timeout = cfg->default_incomplete_timeout;
+	pvt->no_speech_timeout = cfg->default_no_speech_timeout;
 	ast_string_field_set(pvt, call_logging_application_name, "unknown");
 	pvt->speech = speech;
 
@@ -429,6 +440,10 @@ static struct gdf_request *create_new_request(struct gdf_pvt *pvt_locked, int ut
 	req->end_of_speech_minimum_silence = pvt_locked->end_of_speech_minimum_silence;
 	req->session_start = ast_tvnow();
 	req->last_audio_duration_ms = 0;
+	req->incomplete_timeout = pvt_locked->incomplete_timeout;
+	req->no_speech_timeout = pvt_locked->no_speech_timeout;
+	pvt_locked->incomplete_timeout = cfg->default_incomplete_timeout;
+	pvt_locked->no_speech_timeout = cfg->default_no_speech_timeout;
 
 	if (req->voice_minimum_duration || cfg->endpointer_cache_audio_pretrigger_ms) {
 		size_t cache_needed_size = (req->voice_minimum_duration + cfg->endpointer_cache_audio_pretrigger_ms) * 8; /* bytes per millisecond */
@@ -1200,6 +1215,8 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	int barge_duration;
 	int end_of_speech_duration;
 	int heard_speech;
+	milliseconds_t incomplete_timeout;
+	milliseconds_t no_speech_timeout;
 	int datasamples;
 	int datams;
 	int mulaw_len;
@@ -1230,6 +1247,8 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	barge_duration = req->barge_in_minimum_duration;
 	end_of_speech_duration = req->end_of_speech_minimum_silence;
 	heard_speech = req->heard_speech;
+	incomplete_timeout = req->incomplete_timeout;
+	no_speech_timeout = req->no_speech_timeout;
 	ao2_unlock(req);
 
 	cfg = gdf_get_config();
@@ -1442,14 +1461,17 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 		}
 
 		if (state == DF_STATE_STARTED) {
+			int response_count;
 			state = df_write_audio(req->session, mulaw, mulaw_len);
 
-			if (!heard_speech && df_get_response_count(req->session) > 0) {
+			response_count = df_get_response_count(req->session);
+
+			if (!heard_speech && response_count > 0) {
 				heard_speech = 1;
 				gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "auto_barge_in");
 				maybe_signal_speaking(req, state);
 			}
-			if (ast_tvzero(req->dialogflow_barge_in_time) && df_get_response_count(req->session) > 0) {
+			if (ast_tvzero(req->dialogflow_barge_in_time) && response_count > 0) {
 				req->dialogflow_barge_in_time = ast_tvnow();
 			}
 
@@ -1457,6 +1479,30 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 			req->last_audio_duration_ms += mulaw_len / 8;
 			req->heard_speech = heard_speech;
 			ao2_unlock(req);
+
+			if (incomplete_timeout > 0 && response_count > 0) {
+				struct timeval now = ast_tvnow();
+				struct timeval last_transcription_time = df_get_session_last_transcription_time(req->session);
+				
+				if (ast_tvdiff_ms(now, last_transcription_time) > incomplete_timeout) {
+					gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_RECOGNITION, "cancelled_incomplete");
+					ao2_lock(req);
+					req->state = GDFE_STATE_DONE;
+					ao2_unlock(req);
+				}
+			}
+			if (no_speech_timeout > 0 && heard_speech && response_count == 0) {
+				/* we heard speech but have gotten no speech responses */
+				struct timeval now = ast_tvnow();
+				struct timeval barge_in_time = req->endpointer_barge_in_time;
+
+				if (ast_tvdiff_ms(now, barge_in_time) > no_speech_timeout) {
+					gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_RECOGNITION, "cancelled_no_speech");
+					ao2_lock(req);
+					req->state = GDFE_STATE_DONE;
+					ao2_unlock(req);
+				}
+			}
 		}
 	}
  	if (signal_end_of_speech || state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
@@ -1742,6 +1788,14 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 	} else if (!strcasecmp(name, "record") || !strcasecmp(name, "recordUtterance")) {
 		ao2_lock(pvt);
 		pvt->record_next_utterance = ast_true(value);
+		ao2_unlock(pvt);
+	} else if (!strcasecmp(name, "incompleteTimeout")) {
+		ao2_lock(pvt);
+		pvt->incomplete_timeout = atoi(value);
+		ao2_unlock(pvt);
+	} else if (!strcasecmp(name, "noSpeechTimeout")) {
+		ao2_lock(pvt);
+		pvt->no_speech_timeout = atoi(value);
 		ao2_unlock(pvt);
 	} else {
 		ast_log(LOG_DEBUG, "Unknown property '%s'\n", name);
@@ -2373,6 +2427,28 @@ static int load_config(int reload)
 			val = ast_variable_retrieve(cfg, "general", "hints");
 			if (!ast_strlen_zero(val)) {
 				parse_hints(conf->hints, val);
+			}
+		}
+
+		conf->default_incomplete_timeout = 0;
+		val = ast_variable_retrieve(cfg, "general", "default_incomplete_timeout");
+		if (!ast_strlen_zero(val)) {
+			int i;
+			if (1 == sscanf(val, "%d", &i)) {
+				conf->default_incomplete_timeout = i;
+			} else {
+				ast_log(LOG_WARNING, "Invalid value '%s' for default_incomplete_timeout\n", val);
+			}
+		}
+
+		conf->default_no_speech_timeout = 0;
+		val = ast_variable_retrieve(cfg, "general", "default_no_speech_timeout");
+		if (!ast_strlen_zero(val)) {
+			int i;
+			if (1 == sscanf(val, "%d", &i)) {
+				conf->default_no_speech_timeout = i;
+			} else {
+				ast_log(LOG_WARNING, "Invalid value '%s' for default_no_speech_timeout\n", val);
 			}
 		}
 
