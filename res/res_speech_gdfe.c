@@ -250,6 +250,7 @@ struct gdf_config {
 	int use_internal_endpointer_for_end_of_speech;
 	enum SENTIMENT_ANALYSIS_STATE enable_sentiment_analysis;
 
+	int stop_writes_on_final_transcription;
 	int start_recognition_on_start; /* vs. on speech */
 	int recognition_start_failure_retries;
 	int recognition_start_failure_retry_max_time_ms;
@@ -425,6 +426,7 @@ static struct gdf_request *create_new_request(struct gdf_pvt *pvt_locked, int ut
 	df_set_auth_key(req->session, pvt_locked->service_key);
 	df_set_endpoint(req->session, pvt_locked->endpoint);
 	df_set_session_id(req->session, pvt_locked->session_id);
+	df_set_stop_writes_on_final_transcription(req->session, cfg->stop_writes_on_final_transcription);
 
 	ast_string_field_set(req, project_id, pvt_locked->project_id);
 	ast_string_field_set(req, event, pvt_locked->event);
@@ -2372,6 +2374,12 @@ static int load_config(int reload)
 			}
 		}
 
+		conf->stop_writes_on_final_transcription = 1;
+		val = ast_variable_retrieve(cfg, "general", "stop_writes_on_final_transcription");
+		if (!ast_strlen_zero(val)) {
+			conf->stop_writes_on_final_transcription = ast_true(val);
+		}
+
 		conf->start_recognition_on_start = 0;
 		val = ast_variable_retrieve(cfg, "general", "start_recognition_on_start");
 		if (!ast_strlen_zero(val)) {
@@ -2586,6 +2594,7 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "record_preendpointer_on_demand = %s\n", AST_CLI_YESNO(config->record_preendpointer_on_demand));
 			ast_cli(a->fd, "enable_sentiment_analysis = %s\n", config->enable_sentiment_analysis == SENTIMENT_ANALYSIS_ALWAYS ? "always" :
 																config->enable_sentiment_analysis == SENTIMENT_ANALYSIS_DEFAULT ? "default" : "never");
+			ast_cli(a->fd, "stop_writes_on_final_transcription = %s\n", AST_CLI_YESNO(config->stop_writes_on_final_transcription));
 			ast_cli(a->fd, "start_recognition_on_start = %s\n", AST_CLI_YESNO(config->start_recognition_on_start));
 			ast_cli(a->fd, "recognition_start_failure_retries = %d\n", config->recognition_start_failure_retries);
 			ast_cli(a->fd, "recognition_start_failure_retry_max_time_ms = %d\n", config->recognition_start_failure_retry_max_time_ms);
