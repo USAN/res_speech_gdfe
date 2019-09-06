@@ -2487,7 +2487,7 @@ static int load_config(int reload)
 			}
 		}
 
-		conf->default_maximum_speech_timeout = 60 * 1000;
+		conf->default_maximum_speech_timeout = 30 * 1000;
 		val = ast_variable_retrieve(cfg, "general", "default_maximum_speech_timeout");
 		if (!ast_strlen_zero(val)) {
 			int i;
