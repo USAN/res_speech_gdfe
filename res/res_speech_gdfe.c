@@ -121,6 +121,7 @@ struct gdf_pvt {
 
 	milliseconds_t incomplete_timeout;
 	milliseconds_t no_speech_timeout;
+	milliseconds_t maximum_speech_timeout;
 
 	int call_log_open_already_attempted;
 	FILE *call_log_file_handle;
@@ -177,6 +178,7 @@ struct gdf_request {
 
 	milliseconds_t incomplete_timeout;
 	milliseconds_t no_speech_timeout;
+	milliseconds_t maximum_speech_timeout;
 
 	int record_utterance;
 
@@ -194,6 +196,7 @@ struct gdf_request {
 	struct timeval endpointer_end_of_speech_time;
 	struct timeval request_start;
 	struct timeval recognition_initial_attempt;
+	struct timeval speech_start;
 	struct timeval endpointer_barge_in_time;
 	struct timeval dialogflow_barge_in_time;
 	long long last_request_duration_ms;
@@ -242,6 +245,7 @@ struct gdf_config {
 
 	milliseconds_t default_incomplete_timeout;
 	milliseconds_t default_no_speech_timeout;
+	milliseconds_t default_maximum_speech_timeout;
 
 	int enable_call_logs;
 	int enable_preendpointer_recordings;
@@ -376,6 +380,7 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	pvt->session_start = ast_tvnow();
 	pvt->incomplete_timeout = cfg->default_incomplete_timeout;
 	pvt->no_speech_timeout = cfg->default_no_speech_timeout;
+	pvt->maximum_speech_timeout = cfg->default_maximum_speech_timeout;
 	ast_string_field_set(pvt, call_logging_application_name, "unknown");
 	pvt->speech = speech;
 
@@ -390,6 +395,13 @@ static int gdf_create(struct ast_speech *speech, local_ast_format_t format)
 	ao2_t_ref(cfg, -1, "done with creating session");
 
 	return 0;
+}
+
+static void reset_pvt_timeouts_to_defaults_on_new_request(struct gdf_pvt *pvt_locked, struct gdf_config *cfg)
+{
+	pvt_locked->incomplete_timeout = cfg->default_incomplete_timeout;
+	pvt_locked->no_speech_timeout = cfg->default_no_speech_timeout;
+	pvt_locked->maximum_speech_timeout = cfg->default_maximum_speech_timeout;
 }
 
 static struct gdf_request *create_new_request(struct gdf_pvt *pvt_locked, int utterance_number)
@@ -444,8 +456,8 @@ static struct gdf_request *create_new_request(struct gdf_pvt *pvt_locked, int ut
 	req->last_audio_duration_ms = 0;
 	req->incomplete_timeout = pvt_locked->incomplete_timeout;
 	req->no_speech_timeout = pvt_locked->no_speech_timeout;
-	pvt_locked->incomplete_timeout = cfg->default_incomplete_timeout;
-	pvt_locked->no_speech_timeout = cfg->default_no_speech_timeout;
+	req->maximum_speech_timeout = pvt_locked->maximum_speech_timeout;
+	reset_pvt_timeouts_to_defaults_on_new_request(pvt_locked, cfg);
 
 	if (req->voice_minimum_duration || cfg->endpointer_cache_audio_pretrigger_ms) {
 		size_t cache_needed_size = (req->voice_minimum_duration + cfg->endpointer_cache_audio_pretrigger_ms) * 8; /* bytes per millisecond */
@@ -1201,6 +1213,13 @@ static void maybe_signal_speaking(struct gdf_request *req, enum dialogflow_sessi
 	ao2_unlock(req->pvt);
 }
 
+static void mark_request_done(struct gdf_request *req)
+{
+	ao2_lock(req);
+	req->state = GDFE_STATE_DONE;
+	ao2_unlock(req);
+}
+
 static int write_audio_frame(struct gdf_request *req, void *data, int len)
 {
 	enum dialogflow_session_state state;
@@ -1219,6 +1238,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	int heard_speech;
 	milliseconds_t incomplete_timeout;
 	milliseconds_t no_speech_timeout;
+	milliseconds_t maximum_speech_timeout;
 	int datasamples;
 	int datams;
 	int mulaw_len;
@@ -1251,6 +1271,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 	heard_speech = req->heard_speech;
 	incomplete_timeout = req->incomplete_timeout;
 	no_speech_timeout = req->no_speech_timeout;
+	maximum_speech_timeout = req->maximum_speech_timeout;
 	ao2_unlock(req);
 
 	cfg = gdf_get_config();
@@ -1287,6 +1308,9 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 			vad_state = VAD_STATE_SPEAK;
 			cur_duration = change_duration;
 			change_duration = 0;
+			ao2_lock(req);
+			req->speech_start = ast_tvnow();
+			ao2_unlock(req);
 			gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_ENDPOINTER, "start_of_speech");
 		}
 	} else if (vad_state == VAD_STATE_SPEAK) {
@@ -1365,9 +1389,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 				vad_state = VAD_STATE_START;
 			} else {
 				ast_log(LOG_WARNING, "Error pre-starting recognition on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
-				ao2_lock(req);
-				req->state = GDFE_STATE_DONE;
-				ao2_unlock(req);
+				mark_request_done(req);
 			}
 		}
 		ao2_lock(req);
@@ -1428,9 +1450,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 						}
 					} else {
 						ast_log(LOG_WARNING, "Error starting recognition on %d@%s\n", req->current_utterance_number, req->pvt->session_id);
-						ao2_lock(req);
-						req->state = GDFE_STATE_DONE;
-						ao2_unlock(req);
+						mark_request_done(req);
 					}
 				}
 				ao2_lock(req);
@@ -1488,9 +1508,7 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 				
 				if (ast_tvdiff_ms(now, last_transcription_time) > incomplete_timeout) {
 					gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_RECOGNITION, "cancelled_incomplete");
-					ao2_lock(req);
-					req->state = GDFE_STATE_DONE;
-					ao2_unlock(req);
+					mark_request_done(req);
 				}
 			}
 			if (no_speech_timeout > 0 && heard_speech && response_count == 0) {
@@ -1500,17 +1518,22 @@ static int write_audio_frame(struct gdf_request *req, void *data, int len)
 
 				if (ast_tvdiff_ms(now, barge_in_time) > no_speech_timeout) {
 					gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_RECOGNITION, "cancelled_no_speech");
-					ao2_lock(req);
-					req->state = GDFE_STATE_DONE;
-					ao2_unlock(req);
+					mark_request_done(req);
+				}
+			}
+			if (maximum_speech_timeout > 0 && !ast_tvzero(req->speech_start)) {
+				struct timeval now = ast_tvnow();
+				struct timeval speech_start = req->speech_start;
+
+				if (ast_tvdiff_ms(now, speech_start) > maximum_speech_timeout) {
+					gdf_log_call_event_only(req->pvt, req, CALL_LOG_TYPE_RECOGNITION, "cancelled_max_speech");
+					mark_request_done(req);
 				}
 			}
 		}
 	}
  	if (signal_end_of_speech || state == DF_STATE_FINISHED || state == DF_STATE_ERROR) {
-		ao2_lock(req);
-		req->state = GDFE_STATE_DONE;
-		ao2_unlock(req);
+		mark_request_done(req);
 	}
 
 	return 0;
@@ -1774,7 +1797,7 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 	} else if (!strcasecmp(name, "logPromptStart")) {
 		struct dialogflow_log_data log_data[] = {
 			{ "context", pvt->call_logging_context },
-			{ "prompt", S_OR(value, "") }			
+			{ "prompt", S_OR(value, "") }
 		};
 		gdf_log_call_event(pvt, pvt->current_request, CALL_LOG_TYPE_RECOGNITION, "prompt_start", ARRAY_LEN(log_data), log_data);
 	} else if (!strcasecmp(name, "logPromptStop")) {
@@ -1798,6 +1821,10 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 	} else if (!strcasecmp(name, "noSpeechTimeout")) {
 		ao2_lock(pvt);
 		pvt->no_speech_timeout = atoi(value);
+		ao2_unlock(pvt);
+	} else if (!strcasecmp(name, "maximumSpeechTimeout")) {
+		ao2_lock(pvt);
+		pvt->maximum_speech_timeout = atoi(value);
 		ao2_unlock(pvt);
 	} else {
 		ast_log(LOG_DEBUG, "Unknown property '%s'\n", name);
@@ -2460,6 +2487,17 @@ static int load_config(int reload)
 			}
 		}
 
+		conf->default_maximum_speech_timeout = 90 * 1000;
+		val = ast_variable_retrieve(cfg, "general", "default_maximum_speech_timeout");
+		if (!ast_strlen_zero(val)) {
+			int i;
+			if (1 == sscanf(val, "%d", &i)) {
+				conf->default_maximum_speech_timeout = i;
+			} else {
+				ast_log(LOG_WARNING, "Invalid value '%s' for default_maximum_speech_timeout\n", val);
+			}
+		}
+
 		category = NULL;
 		while ((category = ast_category_browse(cfg, category))) {
 			if (strcasecmp("general", category)) {
@@ -2587,6 +2625,9 @@ static char *gdfe_show_config(struct ast_cli_entry *e, int cmd, struct ast_cli_a
 			ast_cli(a->fd, "vad_barge_minimum_duration = %d\n", config->vad_barge_minimum_duration);
 			ast_cli(a->fd, "vad_end_of_speech_silence_duration = %d\n", config->vad_end_of_speech_silence_duration);
 			ast_cli(a->fd, "endpointer_cache_audio_pretrigger_ms = %d\n", config->endpointer_cache_audio_pretrigger_ms);
+			ast_cli(a->fd, "default_incomplete_timeout = %d\n", config->default_incomplete_timeout);
+			ast_cli(a->fd, "default_no_speech_timeout = %d\n", config->default_no_speech_timeout);
+			ast_cli(a->fd, "default_maximum_speech_timeout = %d\n", config->default_maximum_speech_timeout);
 			ast_cli(a->fd, "call_log_location = %s\n", config->call_log_location);
 			ast_cli(a->fd, "enable_call_logs = %s\n", AST_CLI_YESNO(config->enable_call_logs));
 			ast_cli(a->fd, "enable_preendpointer_recordings = %s\n", AST_CLI_YESNO(config->enable_preendpointer_recordings));
