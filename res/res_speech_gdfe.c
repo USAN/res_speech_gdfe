@@ -1797,7 +1797,7 @@ static int gdf_change(struct ast_speech *speech, const char *name, const char *v
 	} else if (!strcasecmp(name, "logPromptStart")) {
 		struct dialogflow_log_data log_data[] = {
 			{ "context", pvt->call_logging_context },
-			{ "prompt", S_OR(value, "") }			
+			{ "prompt", S_OR(value, "") }
 		};
 		gdf_log_call_event(pvt, pvt->current_request, CALL_LOG_TYPE_RECOGNITION, "prompt_start", ARRAY_LEN(log_data), log_data);
 	} else if (!strcasecmp(name, "logPromptStop")) {
