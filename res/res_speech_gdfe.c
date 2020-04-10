@@ -714,11 +714,15 @@ static int load_config(int reload)
 }
 
 static void gdf_log(enum dialogflow_log_level level, const char *file, int line, const char *function, const char *fmt, va_list args)
+	__attribute__((format(printf, 5, 0)));
+
+static void gdf_log(enum dialogflow_log_level level, const char *file, int line, const char *function, const char *fmt, va_list args)
 {
 	char *buff;
+	size_t len;
 	va_list args2;
 	va_copy(args2, args);
-    size_t len = vsnprintf(NULL, 0, fmt, args2);
+    len = vsnprintf(NULL, 0, fmt, args2);
     va_end(args2);
     buff = alloca(len + 1);
     vsnprintf(buff, len + 1, fmt, args);

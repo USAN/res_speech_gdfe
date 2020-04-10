@@ -109,7 +109,7 @@ static void stop_asterisk(void)
 
 static size_t curl_report_data_callback(char *ptr, size_t size, size_t nmemb, void *data)
 {
-    ast_log(LOG_DEBUG, "Got unexpected data on usage report -- '%.*s'.\n", (size * nmemb), ptr);
+    ast_log(LOG_DEBUG, "Got unexpected data on usage report -- '%.*s'.\n", (int)(size * nmemb), ptr);
     return size * nmemb;
 }
 
@@ -204,7 +204,7 @@ static int send_metric_data(const void *_)
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
         if (res != CURLE_OK || http_code != 200) {
             consecutive_failures++;
-            ast_log(LOG_WARNING, "Got error %d posting metric to %s -- %s\n", http_code, report_url, curl_easy_strerror(res));
+            ast_log(LOG_WARNING, "Got error %ld posting metric to %s -- %s\n", http_code, report_url, curl_easy_strerror(res));
 
             /* try to reset the metrics so if we do eventually get through it's correct */
             ast_mutex_lock(&count_lock);
