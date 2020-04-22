@@ -212,6 +212,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	int voice_duration;
 	int silence_duration;
 	int datams;
+	int datasamples;
 
 	ast_mutex_lock(&pvt->lock);
 	orig_vad_state = vad_state = pvt->vad_state;
@@ -222,13 +223,13 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	silence_duration = pvt->silence_minimum_duration;
 	ast_mutex_unlock(&pvt->lock);
 
-	datams = len / 8; /* 8 samples per millisecond */
+	datasamples = len / sizeof(short);
+	datams = datasamples / 8; /* 8 samples per millisecond */
 
 	cur_duration += datams;
 
 	/* we ask for mulaw -- if we ever get slin make sure to change this */
-	avg_level = calculate_audio_level((short *)data, len);
-	if (avg_level >= threshold) {
+	avg_level = calculate_audio_level((short *)data, datasamples);
 		if (vad_state != VAD_STATE_SPEAK) {
 			change_duration += datams;
 		} else {
@@ -279,10 +280,15 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	}
 
 	if (vad_state != VAD_STATE_START) {
+		char *mulaw = (char *)alloca(datasamples * sizeof(char));
+		int i;
+		for (i = 0; i < datasamples; i++) {
+			mulaw[i] = AST_LIN2MU(((short *)data)[i]);
+		}
 		if (option_debug >= 5) {
 			ast_log(LOG_DEBUG, "Writing audio to dfe\n");
 		}
-		state = df_write_audio(pvt->session, data, len);
+		state = df_write_audio(pvt->session, mulaw, datasamples * sizeof(char));
 
 		if (!ast_test_flag(speech, AST_SPEECH_QUIET) && df_get_response_count(pvt->session) > 0) {
 			ast_set_flag(speech, AST_SPEECH_QUIET);
