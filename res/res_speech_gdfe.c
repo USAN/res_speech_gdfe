@@ -184,12 +184,12 @@ static int gdf_deactivate(struct ast_speech *speech, const char *grammar_name)
 	return 0;
 }
 
-static int calculate_audio_level(const char *mulaw, int len)
+static int calculate_audio_level(const short *samples, int len)
 {
 	int i;
 	long long sum = 0;
 	for (i = 0; i < len; i++) {
-		short sample = AST_MULAW((int)mulaw[i]);
+		short sample = samples[i];
 		sum += abs(sample);
 	}
 #ifdef RES_SPEECH_GDFE_DEBUG_VAD
@@ -227,7 +227,7 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	cur_duration += datams;
 
 	/* we ask for mulaw -- if we ever get slin make sure to change this */
-	avg_level = calculate_audio_level((char *)data, len);
+	avg_level = calculate_audio_level((short *)data, len);
 	if (avg_level >= threshold) {
 		if (vad_state != VAD_STATE_SPEAK) {
 			change_duration += datams;
@@ -781,7 +781,7 @@ static enum ast_module_load_result load_module(void)
 		return AST_MODULE_LOAD_FAILURE;
 	}
 
-	ast_format_cap_append(gdf_engine.formats, ast_format_ulaw, 20);
+	ast_format_cap_append(gdf_engine.formats, ast_format_slin, 20);
 
 	if (ast_speech_register(&gdf_engine)) {
 		ast_log(LOG_WARNING, "DFE speech failed to register with speech subsystem\n");
