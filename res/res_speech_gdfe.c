@@ -48,6 +48,8 @@
 #define VAD_PROP_VOICE_DURATION		"voice_duration"
 #define VAD_PROP_SILENCE_DURATION	"silence_duration"
 
+#define RES_SPEECH_GDFE_DEBUG_VAD
+
 enum VAD_STATE {
 	VAD_STATE_START,
 	VAD_STATE_SPEAK,
@@ -65,6 +67,8 @@ struct gdf_pvt {
 	int voice_threshold; /* 0 - (2^16 - 1) */
 	int voice_minimum_duration; /* ms */
 	int silence_minimum_duration; /* ms */
+	int adaption_duration; /* ms */
+	int adapted;
 	
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(session_id);
@@ -80,6 +84,7 @@ struct gdf_config {
 	int vad_voice_threshold;
 	int vad_voice_minimum_duration;
 	int vad_silence_minimum_duration;
+	int vad_adaption_duration;
 
 	AST_DECLARE_STRING_FIELDS(
 		AST_STRING_FIELD(service_key);
@@ -124,6 +129,7 @@ static int gdf_create(struct ast_speech *speech, struct ast_format *format)
 	pvt->voice_threshold = cfg->vad_voice_threshold;
 	pvt->voice_minimum_duration = cfg->vad_voice_minimum_duration;
 	pvt->silence_minimum_duration = cfg->vad_silence_minimum_duration;
+	pvt->adaption_duration = cfg->vad_adaption_duration;
 
 	ast_mutex_lock(&speech->lock);
 	speech->state = AST_SPEECH_STATE_NOT_READY;
@@ -211,6 +217,8 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	int avg_level;
 	int voice_duration;
 	int silence_duration;
+	int adaption_duration;
+	int adapted;
 	int datams;
 	int datasamples;
 
@@ -221,6 +229,8 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	change_duration = pvt->vad_change_duration;
 	voice_duration = pvt->voice_minimum_duration;
 	silence_duration = pvt->silence_minimum_duration;
+	adaption_duration = pvt->adaption_duration;
+	adapted = pvt->adapted;
 	ast_mutex_unlock(&pvt->lock);
 
 	datasamples = len / sizeof(short);
@@ -230,6 +240,15 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 
 	/* we ask for mulaw -- if we ever get slin make sure to change this */
 	avg_level = calculate_audio_level((short *)data, datasamples);
+	if (adaption_duration && !adapted) {
+		long long adapted_threshold = threshold * (cur_duration * 8 * sizeof(short) - len);
+		adapted_threshold += (avg_level * len);
+		threshold = adapted_threshold / (cur_duration * 8 * sizeof(short));
+		if (cur_duration >= adaption_duration) {
+			adapted = 1;
+			threshold = (int)(1.5 * threshold);
+		}
+	} else if (avg_level >= threshold) {
 		if (vad_state != VAD_STATE_SPEAK) {
 			change_duration += datams;
 		} else {
@@ -264,6 +283,8 @@ static int gdf_write(struct ast_speech *speech, void *data, int len)
 	pvt->vad_state = vad_state;
 	pvt->vad_state_duration = cur_duration;
 	pvt->vad_change_duration = change_duration;
+	pvt->voice_threshold = threshold;
+	pvt->adapted = adapted;
 	ast_mutex_unlock(&pvt->lock);
 
 #ifdef RES_SPEECH_GDFE_DEBUG_VAD
@@ -690,6 +711,17 @@ static int load_config(int reload)
 				conf->vad_voice_minimum_duration = i;
 			} else {
 				ast_log(LOG_WARNING, "Invalid value for vad_voice_minimum_duration\n");
+			}
+		}
+
+		conf->vad_adaption_duration = 300; /* ms */
+		val = ast_variable_retrieve(cfg, "general", "vad_adaption_duration");
+		if (!ast_strlen_zero(val)) {
+			int i;
+			if (sscanf(val, "%d", &i) == 1) {
+				conf->vad_adaption_duration = i;
+			} else {
+				ast_log(LOG_WARNING, "Invalid value for vad_adaption_duration\n");
 			}
 		}
 
